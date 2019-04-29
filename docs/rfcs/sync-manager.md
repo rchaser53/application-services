@@ -2,116 +2,124 @@
 
 We've identified the need for a "sync manager" (although are yet to identify a
 good name for it!) This manager will be responsible for managing "global sync
-state" and coordinating each engine. For the purposes of this, we are
-including the "clients" engine in this global state.
+state" and coordinating each engine.
 
-The primary responsibilities of the engine are:
+At a very high level, the sync manager is responsible for all syncing. So far,
+so obvious. However, given our architecture, it's possible to identify a
+key architectural split.
 
-* Manage the "meta/global" resource. This resources holds the following information:
+* The embedding application will be responsible for most high-level operations.
+  For example, the app itself will choose how often regular syncs should
+  happen, what environmental concerns apply (eg, should I only sync on WiFi?),
+  letting the user choose exactly what to sync, and so forth.
 
-    * syncID - the global syncID for the entire storage managed by sync.
+* A lower-level component will be responsible for the direct interaction with
+  the engines and with the various servers needed to perform a sync. It will
+  also have the ultimate responsibility to not cause harm to the service (for
+  example, it will be likely to enforce some kind of rate limiting or ensuring
+  that service requests for backoff are enforced)
 
-    * storageVersion - an integer. If this value is greater than a sync client
-      knows about, that client will refuse to sync. While this is rarely
-      changed, it allows us to lock out older sync clients which could be
-      useful.
+Because all application-services engines are written in Rust, it's tempting to
+suggest that this lower-level component also be written in Rust and everything
+"just works", but there are a couple of complications here:
 
-    * The list of "declined" engines - that is, engines which the user has
-      explicitly declined from syncing. Note that declined engines are global
-      for the account - declining an engine on any device should decline it on
-      every device. While this is something we'd like to consider changing in
-      the future, for now we are sticking with this global declined state.
+* For iOS, we hope to integrate with older engines which aren't written in
+  Rust, even if iOS does move to the new Sync Manager.
 
-    * Some metadata about every collection (which may be subtly different from
-      an "engine"). Currently this metadata is only {version, syncID}
+* For Desktop, we hope to start by reusing the existing "sync manager"
+  implemented by Desktop, and start moving individual engines across.
 
-    Management of meta/global includes all syncIDs - if there's no global
-    syncID, or a collection has no syncID, it should generate one. As we mention
-    below, engines will be responsible for persisting the syncID and version
-    and taking necessary action when it changes. Thus, engines never need to
-    communicate a new syncID back to the global.
+* There may be some cross-crate issues even for the Rust implemented engines.
+  Or more specifically, we'd like to avoid assuming any particular linkage or
+  packaging of Rust implemented engines.
 
-* Query info/collections and pass this information to engines.
+Even with these complications, we expect the high-level component
+to be written in a platform specific language (ie, Kotlin or Swift) and our
+lower-level component to be implemented in Rust and delivered as part of the
+application-services library - but that's not a free-pass.
 
-* Manage interaction with the token server to obtain a token. As part of this,
-  the manager needs to detect when an engine fails to use the token, either
-  due to token expiry, or due to a node reassignment mid sync. The manager will
-  attempt to fetch a new token, and if successful, re-start the sync of the
-  failing engine. If that succeeds but the node has changed, the manager will
-  perform a full reset and restart a sync flow for all engines. If obtaining
-  the new token fails due to auth issues, it will signal to the containing
-  app that it should take some auth action before it can continue.
-  (Note that the manager can help reduce instances of token expiry by ensuring
-  the token is valid for some reasonable time before handing it to an engine)
+# The responsibilities of the Sync Manager.
+
+The primary responsibilities of the "high level" portion of the sync manager are:
+
+* Manage all FxA interaction. The low-level component will have a way to
+  communicate auth related problems, but it is the high-level component
+  which takes concrete FxA action.
+
+* Expose all UI for the user to choose what to sync and coordinate this with
+  the low-level component. Note that because these choices can be made on any
+  connected device, these choices must be communicated in both directions.
+
+* Implement timers or any other mechanism to fully implement the "sync
+  scheduler", including any policy decisions such as only syncing on WiFi,
+  etc.
+
+* Implement a UI so the user can "sync now".
+
+* Collect telemetry from the low-level component, probably augment it, then
+  submit it to the telemetry pipeline.
+
+The primary responsibilities of the "low level" portion of the sync manager are:
+
+* Manage the `meta/global`, `crypto/keys` and `info/collections` resources,
+  and interact with each engine as necessary based on the content of these
+  resources.
+
+* Manage interaction with the token server.
+
+* Enforce constraints necessary to ensure the entire ecosystem is not
+  subject to undue load. For example, this component should ignore attempts to
+  sync continiously, or to sync when the services have requested backoff.
 
 * Manage the "clients" collection - we probably can't ignore this any longer,
   especially for bookmarks (as desktop will send a wipe command on bookmark
-  restore). This involves both communicating with the engine regarding
-  commands targetting it, and accepting commands to be send to other devices.
-  Note however that outgoing commands are likely to not originate from a sync,
-  but instead from other actions, such as "restore bookmarks". While the
-  store *may* be involved in that (and thus able to queue the outgoing command),
-  we should not assume that's always the case. Exactly how to manage this (eg,
-  when we can assume the engine has processed the command?) are TBD.
+  restore, and things will "be bad" if we don't see that command).
+
+* Define a minimal "service state" so certain things can be coordinated with
+  the high-level component. Examples of these states are "everything seems ok",
+  "the service requested we backoff for some period", "an authentication error
+  occurred", and possibly others.
 
 * Perform, or coordinate, the actual sync of the engines - from the containing
-  app's POV, there's a single "sync now" entry-point. Exactly how the manager
-  binds to engines is TBD. It's also likely that we will expose a way to sync
-  a specific engine rather than "sync all".
+  app's POV, there's a single "sync now" entry-point (in practice there might
+  be a couple, but conceptually there's a single way to sync). Note that as
+  mentioned above, this may involve coordinating with engines which aren't
+  implemented in Rust.
 
-* Manage the fact that there may not be a 1:1 relationship between collections
-  and sync engines. For example, it may be true in the future that when we come to
-  syncing "containers", the history engine might require 2 collections to
-  sync. Note that this is subtly different from engines which happen to be
-  closely related - while history and bookmarks, or addresses and credit-cards
-  are related, each can be synced independently so are *not* examples of
-  engines which would leverage this.
+* Manage the collection of (but *not* the submission of) telemetry from the
+  various engines.
 
-  XXX - do we actually need this now? Should we ignore it and wait for
-  a concrete use-case? If we support this in the future, we can probably still
-  have sugar so that the common case of a 1:1 relationship doesn't need to
-  deal with this.
+* Expose APIs and otherwise coordinate with the high-level component.
 
-* It will manage the collection of telemetry from the engines and pass this
-  info back to the app for submission.
+# Implementation Details.
 
-## What the sync manager will not do
+The above has been carefully written to try and avoid implementation details -
+the intent is that it's an overview of the architecture without any specific
+implementation decisions.
 
-For completeness, this section lists things which the sync manager will not do:
+These next sections start getting specific, so implementation choices need to
+be made, and thus will possibly be more contentious.
 
-* It is not a sync scheduler. The containing app will be responsible for
-  knowing when to sync (but as above, the scheduler does know *what* to sync.
+In other words, get your spray-cans ready because there's a bikeshed being built!
 
-* It will not perform authentication - it's role is to signal to the app when
-  an auth problem exists and the app is expected to resolve that.
+However, let's start small and make some general observations.
 
-* It will not directly talk to the token server, although it *will* coordinate
-  use of a token-server client to manage that communication.
-
-* It will not submit telemetry.
-
-* It does not track any changes or validate any collections - these remain the
-  responsibility of the engines.
-
-
-(anything else?)
-
-# Current implementations and challenges with the Rust components
-
-In most current sync implementations, all engines and management of this
-global is located in the "sync" code - they are very close to each other and
-tightly bound. However, the rust components have a different structure which
-offers some challenges.
+## Current implementations and challenges with the Rust components
 
 * Some apps only care about a subset of the engines - lockbox is one such app
-  and only cares about a single collection/engine.
+  and only cares about a single collection/engine. It might be the case that
+  lockbox uses a generic application-services library with many engines
+  available, even though it only wants logins. Thus, the embedding application
+  is the only thing which knows which engines should be considered to "exist".
+  It may be that the app layer passes an engine to the sync manager, or the
+  sync manager knows via some magic how to obtain these handles.
 
-* Some apps will use a combination of Rust components and "traditional"
+* Some apps will use a combination of Rust components and "legacy"
   engines. For example, iOS is moving some of the engines to using Rust
-  components, which other engines are likely to never be ported. We also plan
-  to introduce some rust components into desktop in the same way, meaning
-  desktop will eventually have both rust components and "traditional" engines
-  involved.
+  components, while other engines will be ported after delivery of the
+  sync manager, if they are ported at all. We also plan
+  to introduce some rust engines into desktop without integrating the
+  "sync manager"
 
 * The rust components themselves are designed to be consumed as individual
   components - the "logins" component doesn't know anything about the
@@ -122,99 +130,194 @@ issue when certain engines don't yet appear in meta/global - see bug 1479929
 for all the details.
 
 The tl;dr of the above is that each rust component should be capable of
-working with different sync managers. In all cases, it is important that
-meta/global management is done in a holistic and consistent manner.
+working with different sync managers. That said though, let's not over-engineer
+this and pretend we can design a single, canonical thing that will not need
+changing as we consider desktop and iOS.
 
-# Approach for the rust components
+## State, state and more state. And then some state.
 
-In general, we need to pass certain state around, between the "manager" and
-the engines. We must define this in a way so that the manager can be
-implemented anywhere - we should not assume the manager is implemented in
-rust.
+There's loads of state here. The app itself has some state. The high-level
+Sync Manager component will have state, the low-level component will have state,
+and each engine has state. Some of this state will need to be persisted (either
+on the device or on the storage servers) and some of this state can be considered
+ephemeral and lives only as long as the app.
 
-The individual rust components will not manage the "clients" engine - that will
-be done by the manager - it need to communicate commands sent by other devices
-and commands need to be sent to other devices.
+A key challenge will be defining this state in a coherent way with clear
+boundaries between them, in an effort to allow decoupling of the various bits
+so Desktop and iOS can fit into this world.
 
-We will rely on the consuming app to ensure that the sync manager is
-initialized correctly before syncing any engines.
-
-While we can "trust" each engine, we should try, as much as possible, to
-isolate engine data from other engines. For example, the keys used to encrypt
+This state management should also provide the correct degree of isolation for
+the various components. For example, each engine should only know about state
+which directly impacts how it works. For example, the keys used to encrypt
 a collection should only be exposed to that specific engine, and there's no
-need for one engine to know what info/collections returns for other engines.
+need for one engine to know what info/collections returns for other engines,
+nor whether the device is currently connected to WiFi.
 
-# Implementation plan
+A thorn here is for persisted state - it would be ideal if the low-level
+component could avoid needing to persist any state, so it can avoid any
+kind of storage abstraction. A solution here might be that the low-level
+component can delegate state storage to the high-level component in an
+opaque way.
 
-* The sync manager is responsible for persisting the global syncID and
-  version, considering the state to be "new" if it differs, and failing
-  fatally if the version isn't acceptable. Engines never need to see these
-  values.
+# Implementation plan for the low-level component.
 
-* The sync manager is responsible for managing info/collections, downloading
-  it and uploading it when it needs to be changed. While it is an implementation
-  detail how this is done exactly, important requirements are that it:
+Let's try and move into actionable decisions for the implementation. We expect
+the implementation of the low-level component to happen first, followed very
+closely by the implementation of the high-level component for Android. So we
+focus first on these.
 
-  * Must use if-modified-since to ensure that another client hasn't raced to
-    update it.
+## Clients Engine
 
-  * Ensure that entries for collections which we don't understand are managed
-    correctly (ie, not discarded or otherwise changed)
+The clients engine includes some meta-data about each client. We've decided
+we can't replace the clients engine with the FxA device record and we can't
+simply drop this engine entirely.
 
-* The sync manager is responsible for persisting and populating the "declined"
-  engine list. If an engine is declined, the manager should not ask it to
-  sync. IOW, an engine doesn't really need to know whether it is enabled or
-  not. However, engines should expose a way to be "reset" when the manager
-  notices the declined state for an engine has been changed. This will allow
-  engines to optimize certain things, such as not keeping tomstones etc. As
-  part of this, the sync manager must expose an API so the consuming
-  application can change the disabled engine state.
+Of particular interest is "commands" - these involve communicating with the
+engine regarding commands targetting it, and accepting commands to be send to
+other devices. Note that outgoing commands are likely to not originate from a sync,
+but instead from other actions, such as "restore bookmarks".
 
-* The sync manager is responsible for managing the "clients" collection -
-  engines should never see details about that engine. However, engines will
-  need the ability to be told about commands targetting that engine. The sync
-  manager will also need to be able to accept commands to be delivered to
-  other clients - although that needs more thought as the conditions in which
-  a command need to be sent typically aren't managed by the engine itself -
-  eg, when a "bookmark" restore is done.
+However, because the only current requirement for commands is to wipe the
+store, and because you could anticipate "wipe" also being used when remotely
+disconnecting a device (eg, when a device is lost or stolen), our lives would
+probably be made much simpler by initially supporting only per-engine wipe
+commands.
 
-* Each engine is responsible for persisting engine-specific stuff which needs
-  to be persisted. An obvious thing which needs to be persisted is the syncID
-  and version string for the engine itself, so it can take the necessary
-  action when these change.
+## Collections vs engines vs stores vs preferences
 
-* The sync manager will call a special "prepare" function on the engine,
-  passing the current global version and the engine's current syncID and
-  version. This function will return an enum of actions the manager should
-  take. Initial supported actions will include only "can't sync due to version",
-  but we forsee a requirement in the future which indicates "please abandon
-  this syncID and generate a new one" to support the use-case described in
-  [this bug](https://bugzilla.mozilla.org/show_bug.cgi?id=1199077#c23).
-  Note that this function could fail (eg, storage might be corrupt), in which
-  case the engine will not be asked to sync.
+For the purposes of the sync manager, we define:
 
-* The sync manager will manage keys and pass the relevant key into the engine.
-  Keys for engines should not be exposed to engines other than the key it is
-  for (although currently, in practice, all engines share the same key, but
-  this is an implementation detail.)
+* An *engine* is the unit exposed to the user - an "engine" can be enabled
+  or disabled. There is a single set of canonical "engines" used across the
+  entire sync ecosystem - ie, desktop and mobile devices all need to agree
+  about what engines exist and what the identifier for an engine is.
 
-* The sync manager will pass the relevant part of info/collections to the
-  engine and a token which can be used to access storage. Specific engines
-  never talk to the token server.
+* A *store* is the code which actually syncs. This is largely an implementation
+  detail. There may be multiple stores per engine (eg, the "history" engine
+  may have "history" and "forms" stores.)
 
-## Rust implementation plan
+* A *collection* is a unit of storage on a server. It's even more of an
+  implementation detail than a store. For example, you might imagine a future
+  where the "history" store uses multiple "collections" to help with containers.
 
-We will implement a sync manager in Rust. In the first instance, the Rust
-implemented manager will only support Rust implemented engines - there are
-no current requirements for this implementation to support "external" engines.
+In practice, this means that the high-level component should only need to care
+about an *engine*. The low-level component will manage the mapping of engines
+to stores.
 
-Further, this Rust implementation will only support engines implemented in the
-same library as the manager. This should ease the registration and calling of
-engines by the rust code and avoid requiring the FFI to pass object or
-function references around. It also means that there remains a single function
-in our library to perform the sync of whatever engines are in the library.
+## The declined list
 
-## External implementation plans
+This document isn't going to outline the history of how "declined" is used, nor
+talk about how this might change in the future. For the purposes of the sync
+manager, we have the following hard requirements:
+
+* The low-level component needs to know what the currently declined set of
+  engines is for the purposes of re-populating `meta/global`.
+
+* The low-level component needs to know when the declined set needs to change
+  based on user input (ie, when the user opts in to or out of a particular
+  engine on this device)
+
+* The high-level component needs to be aware that the set of declined engines
+  may change on every sync (ie, when the user opts in to or out of a particular
+  engine on another device)
+
+A complication is that due to networks being unreliable, there's an inherent
+conflict between "what is the current state?" and "what state changes are
+requested?". For example, if the user changes the state of an engine while
+there's no network, then exits the app, how do we ensure the user's new state
+is updated next time the app starts? What if the user has since made a
+different state request on a different device? Is the state as last-known on
+this device considered canonical?
+
+To clarify, consider:
+
+* User on this device declines logins. This device now believes logins is
+  disabled but history is enabled, but is unable to write this to the server
+  due to no network.
+
+* The user declines history on a different device, but doesn't change logins.
+  This device does manage to write the new list to the server.
+
+* This device restarts and the network is up. It believes history is enabled
+  but logins is now - however, the state on the server is the exact opposite.
+
+How does this device react?
+
+(On the plus side, this is an extreme edge-case which none of our existing
+implementations handle "correctly" - which is easy to say, because there's
+no real definition for "correctly")
+
+Regardless, the low-level component will not pretend to hide this complexity
+(ie, it will ignore it!). The low-level component will allow the app to ask
+for state changes as part of a sync, and will return what's on the server at
+the end of every sync. The app is then free to build whatever experience
+it desires around this.
+
+## Disconnecting from Sync
+
+The low-level component needs to have the ability to disconnect all engines
+from Sync. Engines which are declined should also be reset.
+
+Because we will need wipe() functionality to implement the clients engine,
+and because Lockbox wants to wipe on disconnect, we will provide disconnect
+and wipe functionality.
+
+# Specific deliverables for the low-level component.
+
+Breaking the above down into actionable tasks which can be some somewhat
+concurrently, we will deliver:
+
+## The API
+
+A straw-man for the API we will expose to the high-level components. This
+probably isn't too big, but we should do this as thoroughly as we can. In
+particular, ensure we have covered:
+
+* Declined management - how the app changes the declined list and how it learns
+  of changes from other devices.
+
+* How telemetry gets handed from the low-level to the high-level.
+
+* The "state" - in particular, how the high-level component understands the
+  auth state is wrong, and whether the service is in a degraded mode (eg,
+  server requested backoff)
+
+* How the high-level component might specify "special" syncs, such as "just
+  one engine" or "this is a pre-sleep, quick-as-possible sync", etc
+
+There's a straw-man proposal for this at the end of the document.
+
+## A command-line (and possibly Android) utility.
+
+We should build a utility (or 2) which can stand in for the high-level
+component, for testing and demonstration purposes.
+
+This is something like places-utils.rs and the little utility Grisha has
+been using. This utility should act like a real client (ie, it should have
+an FxA device record, etc) and it should use the low-level component in
+exactly the same we we expect real products to use it.
+
+Because it is just a consumer of the low-level component, it will force us to
+confront some key issues, such as how to get references to engines stored in
+multiple crates, how to present a unified "state" for things like auth errors,
+etc.
+
+## The "clients" engine
+
+The initial work for the clients engine can probably be done without too
+much regard for how things are tied together - for example, much work could
+be done without caring how we get a reference to engines across crates.
+
+## State work
+
+Implementing things needed to we can expose the correct state to the high-level
+manager for things like auth errors, backoff semantics, etc
+
+## Tie it together and other misc things.
+
+There will be lots of loose ends to clean up - things like telemetry, etc.
+
+# Followup with non-rust engines.
 
 We have identified that iOS will, at least in the short term, want the
 sync manager to be implemented in Swift. This will be responsible for
@@ -236,143 +339,135 @@ to do so (ie, it already has info/collections etc)
 TODO: dig into the Swift code and make sure this is sane.
 
 # Details
-## Structure definitions
 
 While we use rust struct definitions here, it's important to keep in mind that
 as mentioned above, we'll need to support the manager being written in
-something other than rust. The definitions below are designed to be easy to
-serialize and used across the FFI - probably using protobufs, although JSON
-would also be an option if there was a good reason to prefer that.
+something other than rust, and to support engines written in other than rust.
+
+The structures below are a straw-man, but hopefully capture all the information
+that needs to be passed around.
 
 ```rust
-// The main structure passed to a sync implementation. This needs to carry
-// all state necessary to sync.
-struct GlobalEngineState {
-    // note: no "declined" or "enabled" here - that's invisible to the engine.
 
-    // the result of info/configuration.
-    config: GlobalConfig,
-
-    // The token server token, used for authenticating with the storage servers.
-    storage_token: Vec<u8>, // (??) not clear on the type here, but whatever.
-
-    // Info about the collections managed by this engine. In most cases there
-    // will be exactly 1.
-    collections: HashMap<String, CollectionState>
+// We want to define a list of "engine IDs" - ie, canonical strings which
+// refer to what the user perceives as an "enigine" - but as above, these
+// *do not* correspond 1:1 with either "stores" or "collections" (eg, "history"
+// refers to 2 stores, and in a future world, might involve 3 collections).
+enum Engine {
+  History, // The "History" and "Forms" stores.
+  Bookmarks, // The "Bookmark" store.
+  Passwords,
 }
 
-// The state for a collection. Most engines will manage a single collection, but
-// there may be many.
-struct CollectionState {
-    // The info/collections response for this collection.
-    collection_info: CollectionInfo,
-
-    // The current syncID for the engine, as read from meta/global. Will never
-    // be None as the sync manager is responsbile for generating an ID if
-    // it doesn't exist.
-    // Engines are responsible for persisting this and taking action when it
-    // differs from last time.
-    sync_id: SyncGuid,
-
-    // The current version for the engine, as read from meta/global.
-    // Not clear that "u32" is the best option here - I guess it's OK so
-    // long as we treat an invalid u32 representation sanely.
-    // Note that persisting this may not be required if there's only one
-    // version supported, as the value can be compared against a hard-coded
-    // value in the engine.
-    version: u32,
-
-    // The keys to be used for this collection. This may be the default key (ie,
-    // used for all collections) or one specific to the collection, but the
-    // engine doesn't need to know that.
-    keys: KeyBundle,
-
-    // Commands the engine should act upon before syncing.
-    commands: Vec<Command>
+impl Engine {
+  fn as_str(&self) -> &'static str {
+    match self {
+      History => "history",
+      // etc
+  }
 }
 
-// Used to support commands. Will either be a strongly typed enum, or a
-// weakly typed thing (such as {command: String, args: Vec<String>})
-// TBD.
-struct Command {
-    ...
+// A struct which reflects engine declined states.
+struct EngineState {
+  engine: Engine,
+  enabled: bool,
+}
+
+// A straw-man for the reasons why a sync is happening.
+enum SyncReason {
+  Scheduled,
+  User,
+  PreSleep,
+  Startup,
+}
+
+// A straw man for the general status.
+enum ServiceStatus {
+  Ok,
+  // Some general network issue.
+  NetworkError,
+  // Some apparent issue with the servers.
+  ServiceError,
+  // Some external FxA action needs to be taken.
+  AuthenticationError,
+  // We declined to do anything for backoff or rate-limiting reasons.
+  BackedOff,
+  // Something else - you need to check the logs for more details.
+  OtherError,
+}
+
+// Info we need from FxA to sync. This is roughly our Sync15StorageClientInit
+// structure with the FxA device ID.
+struct AccountInfo {
+  key_id: String,
+  access_token: String,
+  tokenserver_url: Url,
+  device_id: String,
+}
+
+// Instead of massive param and result lists, we use structures.
+// This structure is passed to each and every sync.
+struct SyncParams {
+  // The engines to Sync. None means "sync all"
+  engines: Option<Vec<Engine>>,
+  // Why this sync is being done.
+  reason: SyncReason,
+
+  // Any state changes which should be done as part of this sync.
+  engine_state_changes: Vec<EngineState>,
+
+  // An opaque state "blob". This should be persisted by the app so it is
+  // reused next sync.
+  persisted_state: Option<String>,
+}
+
+struct SyncResult {
+  // The general health.
+  service_status: ServiceStatus,
+
+  // The result for each engine.
+  engine_results: HashMap<Engine, Result<()>>,
+
+  // The list of declined engines, or None if we failed to get that far.
+  declined_engines: Option<Vec<Engine>>,
+
+  // When we are allowed to sync again. If > now() then there's some kind
+  // of back-off. Note that it's not strictly necessary for the app to
+  // enforce this (ie, it can keep asking us to sync, but we might decline).
+  // But we might not too - eg, we might try a user-initiated sync.
+  next_sync_allowed_at: Timestamp,
+
+  // New opaque state which should be persisted by the embedding app and supplied
+  // the next time Sync is called.
+  persisted_state: String,
+
+  // Telemetry. Nailing this down is tbd.
+  telemetry: Option<JSONValue>,
+}
+
+struct SyncManager {}
+
+impl SyncManager {
+  // Initialize the sync manager with the set of Engines known by this
+  // application without regard to the enabled/declined states.
+  // XXX - still TBD is how we will pass "stores" around - it may be that
+  // this function ends up taking an `impl Store`
+  fn init(&self, engines: Vec<&str>) -> Result<()>;
+
+  fn sync(&self, params: SyncParams) -> Result<SyncResult>;
+
+  // Interrupt any current syncs. Note that this can be called from a different
+  // thread.
+  fn interrupt() -> Result<()>;
+
+  // Disconnect this device from sync. This may "reset" the store, but will
+  // not wipe local data.
+  fn disconnect(&self) -> Result<()>;
+
+  // Wipe all local data for all local stores. This can be done after
+  // disconnecting.
+  // There's no exposed way to wipe the remote store - while it's possible
+  // stores will want to do this, there's no need to expose this to the user.
+  fn wipe(&self) -> Result<()>;
 }
 ```
-
-## APIs
-## Sync Manager
-
-```rust
-// Get the list of engines which are declined. There's a bit of confusion here
-// between an "engine" and a "collection" - eg, assuming history ends up using
-// 2 collections, the UI will want 1 entry.
-// Maybe we define this as a "collection" and the app should ignore collections
-// it doesn't understand?
-// Will return None if we haven't yet done a first sync so don't know. Will
-// return an empty vec if we have synced but no engines are declined.
-fn get_declined() -> Option<Vec<String>>;
-
-// Ditto here - a bit of confusion between "collection" and "engine" here.
-fn enable_engine(String, bool) -> Result<()>;
-
-// TODO: let's think a little more about how desktop uses a single "addons"
-// pref which controls addons *and* storage.sync, and how a single "Forms"
-// pref controls 2 discrete engines.
-
-// Do a sync now. There's a special error code to indicate that something
-// seems to have gone wrong with auth, which is surfaced to the app, so
-// it can call on FxA to do magic.
-fn sync_now(engines: Option<Vec<String>>) -> Result<()>;
-
-// Stop syncing ASAP. This might be called as the app is shutting down or when
-// the app has lost wifi, for example.
-fn stop();
-
-// others?
-```
-
-## Engines
-
-```rust
-#[repr(u8)]
-pub enum PrepareAction {
-    // No special action is required.
-    NoAction = 0,
-    // This engine can not sync because the version already on the server is
-    // greater than this engine supports.
-    VersionLockout = 1,
-    // The sync engine is attempting to recover from an unusual state and the
-    // existing syncID should be discarded.
-    NewSyncId = 2,
-}
-
-// Prepare for a sync. Passed whatever values are in info/collections
-// before the sync manager has generated new GUIDs or versions (ie, on
-// the very first sync to a new storage node, we'd expect all to be None).
-// Result is the action the manager should take before calling the sync
-// method.
-fn prepare(global_version: Option<u32>, engine_syncid: Option<SyncGuid>, engine_version: Option<u32>) -> Result<PrepareAction>;
-
-// Perform the sync of the engine. When asked to sync, the manager will
-// create a GlobalEngineState specific to the engine and pass it in.
-fn sync(state: GlobalEngineState) -> Result<SomeTelemetryObject>;
-```
-
-### Notes
-
-Just random notes by markh - this should be either deleted or incorporated
-into the above
-
-meta/global has:
-syncID: 
-storageVersion: always 5
-declined: list of declined engines
-engines: list of {version, syncID} meta about each non-declined engine
-Desktop:
-
-* First sync for a session fetches meta/global.
-* 401 means "node reassignment" so early exit.
-* 404 means first sync on a new node - must be uploaded.
-
-then uploads partial meta/global - no engines are there yet. It uploads
-engines as they are synced the first time.
