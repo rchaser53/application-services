@@ -4,23 +4,13 @@
 
 use crate::error::{self, ErrorKind, Result};
 use crate::util::ServerTimestamp;
-use hyper::header::AUTHORIZATION;
-use reqwest::{Client, Request, Url};
 use serde_derive::*;
 use std::borrow::{Borrow, Cow};
 use std::cell::RefCell;
 use std::fmt;
-use std::str::FromStr;
 use std::time::{Duration, SystemTime};
-
-/// Tokenserver's timestamp is X-Timestamp and not X-Weave-Timestamp.
-const RETRY_AFTER: &str = "Retry-After";
-
-/// Tokenserver's timestamp is X-Timestamp and not X-Weave-Timestamp. The value is in seconds.
-const X_TIMESTAMP: &str = "X-Timestamp";
-
-/// OAuth tokenserver api uses this instead of X-Client-State.
-const X_KEY_ID: &str = "X-KeyID";
+use url::Url;
+use viaduct::{header_names, Request};
 
 const RETRY_AFTER_DEFAULT_MS: u64 = 10000;
 
@@ -46,7 +36,7 @@ struct TokenFetchResult {
 // The trait for fetching tokens - we'll provide a "real" implementation but
 // tests will re-implement it.
 trait TokenFetcher {
-    fn fetch_token(&self, request_client: &Client) -> super::Result<TokenFetchResult>;
+    fn fetch_token(&self) -> super::Result<TokenFetchResult>;
     // We allow the trait to tell us what the time is so tests can get funky.
     fn now(&self) -> SystemTime;
 }
@@ -61,53 +51,68 @@ struct TokenServerFetcher {
     key_id: String,
 }
 
+fn fixup_server_url(mut url: Url) -> Result<Url> {
+    // base_url is the end-point as returned by .well-known/fxa-client-configuration,
+    // or as directly specified by self-hosters. As a result, it may or may not have
+    // the sync 1.5 suffix of "/1.0/sync/1.5" - so add it on here if it does not.
+    // (Note that base_url must end in a slash, or the last path element in
+    // the base url will be replaced with this suffix.)
+    if url.as_str().ends_with("1.0/sync/1.5") {
+        Ok(url)
+    } else if url.as_str().ends_with("1.0/sync/1.5/") {
+        // Shouldn't ever be Err() here, but the result is `Result<PathSegmentsMut, ()>`
+        // and I don't want to unwrap or add a new error type just for PathSegmentsMut failing.
+        if let Ok(mut path) = url.path_segments_mut() {
+            path.pop();
+        }
+        Ok(url)
+    } else {
+        Ok(url.join("1.0/sync/1.5")?)
+    }
+}
+
 impl TokenServerFetcher {
-    fn new(server_url: Url, access_token: String, key_id: String) -> TokenServerFetcher {
-        TokenServerFetcher {
-            server_url,
+    fn new(base_url: Url, access_token: String, key_id: String) -> Result<TokenServerFetcher> {
+        Ok(TokenServerFetcher {
+            server_url: fixup_server_url(base_url)?,
             access_token,
             key_id,
-        }
+        })
     }
 }
 
 impl TokenFetcher for TokenServerFetcher {
-    fn fetch_token(&self, request_client: &Client) -> Result<TokenFetchResult> {
-        let mut resp = request_client
-            .get(self.server_url.clone())
-            .header(AUTHORIZATION, format!("Bearer {}", self.access_token))
-            .header(X_KEY_ID, self.key_id.clone())
+    fn fetch_token(&self) -> Result<TokenFetchResult> {
+        log::trace!("Fetching token from {}", self.server_url);
+        let resp = Request::get(self.server_url.clone())
+            .header(
+                header_names::AUTHORIZATION,
+                format!("Bearer {}", self.access_token),
+            )?
+            .header(header_names::X_KEYID, self.key_id.clone())?
             .send()?;
 
-        if !resp.status().is_success() {
-            log::warn!("Non-success status when fetching token: {}", resp.status());
+        if !resp.is_success() {
+            log::warn!("Non-success status when fetching token: {}", resp.status);
             // TODO: the body should be JSON and contain a status parameter we might need?
-            log::trace!(
-                "  Response body {}",
-                resp.text().unwrap_or_else(|_| "???".into())
-            );
+            log::trace!("  Response body {}", resp.text());
             // XXX - shouldn't we "chain" these errors - ie, a BackoffError could
             // have a TokenserverHttpError as its cause?
-            if let Some(header) = resp.headers().get(RETRY_AFTER) {
-                // XXX - We are silently dropping parsing errors here.
-                let ms = header
-                    .to_str()
+            if let Some(res) = resp.headers.get_as::<f64, _>(header_names::RETRY_AFTER) {
+                let ms = res
                     .ok()
-                    .and_then(|s| s.parse::<f64>().ok())
                     .map_or(RETRY_AFTER_DEFAULT_MS, |f| (f * 1000f64) as u64);
                 let when = self.now() + Duration::from_millis(ms);
                 return Err(ErrorKind::BackoffError(when).into());
             }
-            let status = resp.status().as_u16();
+            let status = resp.status;
             return Err(ErrorKind::TokenserverHttpError(status).into());
         }
 
         let token: TokenserverToken = resp.json()?;
         let server_timestamp = resp
-            .headers()
-            .get(X_TIMESTAMP)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| ServerTimestamp::from_str(s).ok())
+            .headers
+            .try_get::<ServerTimestamp, _>(header_names::X_TIMESTAMP)
             .ok_or_else(|| ErrorKind::MissingServerTimestamp)?;
         Ok(TokenFetchResult {
             token,
@@ -131,7 +136,7 @@ struct TokenContext {
 
 // hawk::Credentials doesn't implement debug -_-
 impl fmt::Debug for TokenContext {
-    fn fmt(&self, f: &mut fmt::Formatter) -> ::std::result::Result<(), fmt::Error> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> ::std::result::Result<(), fmt::Error> {
         f.debug_struct("TokenContext")
             .field("token", &self.token)
             .field("credentials", &"(omitted)")
@@ -167,7 +172,7 @@ impl TokenContext {
     }
 
     fn authorization(&self, req: &Request) -> Result<String> {
-        let url = req.url();
+        let url = &req.url;
 
         let path_and_query = match url.query() {
             None => Cow::from(url.path()),
@@ -186,7 +191,7 @@ impl TokenContext {
         })?;
 
         let header =
-            hawk::RequestBuilder::new(req.method().as_ref(), host, port, path_and_query.borrow())
+            hawk::RequestBuilder::new(req.method.as_str(), host, port, path_and_query.borrow())
                 .request()
                 .make_header(&self.credentials)?;
 
@@ -233,8 +238,8 @@ impl<TF: TokenFetcher> TokenProviderImpl<TF> {
 
     // Uses our fetcher to grab a new token and if successfull, derives other
     // info from that token into a usable TokenContext.
-    fn fetch_context(&self, request_client: &Client) -> Result<TokenContext> {
-        let result = self.fetcher.fetch_token(request_client)?;
+    fn fetch_context(&self) -> Result<TokenContext> {
+        let result = self.fetcher.fetch_token()?;
         let token = result.token;
         let valid_until = SystemTime::now() + Duration::from_secs(token.duration);
 
@@ -254,8 +259,8 @@ impl<TF: TokenFetcher> TokenProviderImpl<TF> {
     // Attempt to fetch a new token and return a new state reflecting that
     // operation. If it worked a TokenState will be returned, but errors may
     // cause other states.
-    fn fetch_token(&self, request_client: &Client, previous_endpoint: Option<&str>) -> TokenState {
-        match self.fetch_context(request_client) {
+    fn fetch_token(&self, previous_endpoint: Option<&str>) -> TokenState {
+        match self.fetch_context() {
             Ok(tc) => {
                 // We got a new token - check that the endpoint is the same
                 // as a previous endpoint we saw (if any)
@@ -281,9 +286,9 @@ impl<TF: TokenFetcher> TokenProviderImpl<TF> {
             Err(e) => {
                 // Early to avoid nll issues...
                 if let ErrorKind::BackoffError(be) = e.kind() {
-                    return TokenState::Backoff(*be, previous_endpoint.map(|s| s.to_string()));
+                    return TokenState::Backoff(*be, previous_endpoint.map(ToString::to_string));
                 }
-                TokenState::Failed(Some(e), previous_endpoint.map(|s| s.to_string()))
+                TokenState::Failed(Some(e), previous_endpoint.map(ToString::to_string))
             }
         }
     }
@@ -292,21 +297,17 @@ impl<TF: TokenFetcher> TokenProviderImpl<TF> {
     // Returns None if the current state should be used (eg, if we are
     // holding a token that remains valid) or Some() if the state has changed
     // (which may have changed to a state with a token or an error state)
-    fn advance_state(&self, request_client: &Client, state: &TokenState) -> Option<TokenState> {
+    fn advance_state(&self, state: &TokenState) -> Option<TokenState> {
         match state {
-            TokenState::NoToken => Some(self.fetch_token(request_client, None)),
-            TokenState::Failed(_, existing_endpoint) => Some(self.fetch_token(
-                request_client,
-                existing_endpoint.as_ref().map(|e| e.as_str()),
-            )),
+            TokenState::NoToken => Some(self.fetch_token(None)),
+            TokenState::Failed(_, existing_endpoint) => {
+                Some(self.fetch_token(existing_endpoint.as_ref().map(String::as_str)))
+            }
             TokenState::Token(existing_context) => {
                 if existing_context.is_valid(self.fetcher.now()) {
                     None
                 } else {
-                    Some(self.fetch_token(
-                        request_client,
-                        Some(existing_context.token.api_endpoint.as_str()),
-                    ))
+                    Some(self.fetch_token(Some(existing_context.token.api_endpoint.as_str())))
                 }
             }
             TokenState::Backoff(ref until, ref existing_endpoint) => {
@@ -315,10 +316,7 @@ impl<TF: TokenFetcher> TokenProviderImpl<TF> {
                     None
                 } else {
                     // backoff period is over
-                    Some(self.fetch_token(
-                        request_client,
-                        existing_endpoint.as_ref().map(|e| e.as_str()),
-                    ))
+                    Some(self.fetch_token(existing_endpoint.as_ref().map(String::as_str)))
                 }
             }
             TokenState::NodeReassigned => {
@@ -328,16 +326,15 @@ impl<TF: TokenFetcher> TokenProviderImpl<TF> {
         }
     }
 
-    fn with_token<T, F>(&self, request_client: &Client, func: F) -> Result<T>
+    fn with_token<T, F>(&self, func: F) -> Result<T>
     where
         F: FnOnce(&TokenContext) -> Result<T>,
     {
         // first get a mutable ref to our existing state, advance to the
         // state we will use, then re-stash that state for next time.
         let state: &mut TokenState = &mut self.current_state.borrow_mut();
-        match self.advance_state(request_client, state) {
-            Some(new_state) => *state = new_state,
-            None => (),
+        if let Some(new_state) = self.advance_state(state) {
+            *state = new_state;
         }
 
         // Now re-fetch the state we should use for this call - if it's
@@ -353,28 +350,28 @@ impl<TF: TokenFetcher> TokenProviderImpl<TF> {
             }
             TokenState::Failed(e, _) => {
                 // We swap the error out of the state enum and return it.
-                return Err(e.take().unwrap());
+                Err(e.take().unwrap())
             }
             TokenState::NodeReassigned => {
                 // this is unrecoverable.
-                return Err(ErrorKind::StorageResetError.into());
+                Err(ErrorKind::StorageResetError.into())
             }
             TokenState::Backoff(ref remaining, _) => {
-                return Err(ErrorKind::BackoffError(*remaining).into());
+                Err(ErrorKind::BackoffError(*remaining).into())
             }
         }
     }
 
-    fn hashed_uid(&self, http_client: &Client) -> Result<String> {
-        self.with_token(http_client, |ctx| Ok(ctx.token.hashed_fxa_uid.clone()))
+    fn hashed_uid(&self) -> Result<String> {
+        self.with_token(|ctx| Ok(ctx.token.hashed_fxa_uid.clone()))
     }
 
-    fn authorization(&self, http_client: &Client, req: &Request) -> Result<String> {
-        self.with_token(http_client, |ctx| ctx.authorization(req))
+    fn authorization(&self, req: &Request) -> Result<String> {
+        self.with_token(|ctx| ctx.authorization(req))
     }
 
-    fn api_endpoint(&self, http_client: &Client) -> Result<String> {
-        self.with_token(http_client, |ctx| Ok(ctx.token.api_endpoint.clone()))
+    fn api_endpoint(&self) -> Result<String> {
+        self.with_token(|ctx| Ok(ctx.token.api_endpoint.clone()))
     }
     // TODO: we probably want a "drop_token/context" type method so that when
     // using a token with some validity fails the caller can force a new one
@@ -388,38 +385,30 @@ pub struct TokenProvider {
 }
 
 impl TokenProvider {
-    pub fn new(url: Url, access_token: String, key_id: String) -> Self {
-        let fetcher = TokenServerFetcher::new(url, access_token, key_id);
-        Self {
+    pub fn new(url: Url, access_token: String, key_id: String) -> Result<Self> {
+        let fetcher = TokenServerFetcher::new(url, access_token, key_id)?;
+        Ok(Self {
             imp: TokenProviderImpl::new(fetcher),
-        }
+        })
     }
 
-    pub fn hashed_uid(&self, http_client: &Client) -> Result<String> {
-        self.imp.hashed_uid(http_client)
+    pub fn hashed_uid(&self) -> Result<String> {
+        self.imp.hashed_uid()
     }
 
-    pub fn authorization(&self, http_client: &Client, req: &Request) -> Result<String> {
-        self.imp.authorization(http_client, req)
+    pub fn authorization(&self, req: &Request) -> Result<String> {
+        self.imp.authorization(req)
     }
 
-    pub fn api_endpoint(&self, http_client: &Client) -> Result<String> {
-        self.imp.api_endpoint(http_client)
+    pub fn api_endpoint(&self) -> Result<String> {
+        self.imp.api_endpoint()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reqwest::Client;
     use std::cell::Cell;
-
-    fn make_client() -> Client {
-        Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("can't build client")
-    }
 
     struct TestFetcher<FF, FN>
     where
@@ -434,7 +423,7 @@ mod tests {
         FF: Fn() -> Result<TokenFetchResult>,
         FN: Fn() -> SystemTime,
     {
-        fn fetch_token(&self, _: &Client) -> Result<TokenFetchResult> {
+        fn fetch_token(&self) -> Result<TokenFetchResult> {
             (self.fetch)()
         }
         fn now(&self) -> SystemTime {
@@ -470,13 +459,13 @@ mod tests {
             })
         };
 
-        let tsc = make_tsc(fetch, || SystemTime::now());
+        let tsc = make_tsc(fetch, SystemTime::now);
 
-        let e = tsc.api_endpoint(&make_client()).expect("should work");
+        let e = tsc.api_endpoint().expect("should work");
         assert_eq!(e, "api_endpoint".to_string());
         assert_eq!(counter.get(), 1);
 
-        let e2 = tsc.api_endpoint(&make_client()).expect("should work");
+        let e2 = tsc.api_endpoint().expect("should work");
         assert_eq!(e2, "api_endpoint".to_string());
         // should not have re-fetched.
         assert_eq!(counter.get(), 1);
@@ -488,17 +477,17 @@ mod tests {
         let fetch = || {
             counter.set(counter.get() + 1);
             let when = SystemTime::now() + Duration::from_millis(10000);
-            return Err(error::Error::from(ErrorKind::BackoffError(when)));
+            Err(error::Error::from(ErrorKind::BackoffError(when)))
         };
         let now: Cell<SystemTime> = Cell::new(SystemTime::now());
         let tsc = make_tsc(fetch, || now.get());
 
-        tsc.api_endpoint(&make_client()).expect_err("should bail");
+        tsc.api_endpoint().expect_err("should bail");
         // XXX - check error type.
         assert_eq!(counter.get(), 1);
         // try and get another token - should not re-fetch as backoff is still
         // in progress.
-        tsc.api_endpoint(&make_client()).expect_err("should bail");
+        tsc.api_endpoint().expect_err("should bail");
         assert_eq!(counter.get(), 1);
 
         // Advance the clock.
@@ -506,7 +495,7 @@ mod tests {
 
         // Our token fetch mock is still returning a backoff error, so we
         // still fail, but should have re-hit the fetch function.
-        tsc.api_endpoint(&make_client()).expect_err("should bail");
+        tsc.api_endpoint().expect_err("should bail");
         assert_eq!(counter.get(), 2);
     }
 
@@ -530,21 +519,51 @@ mod tests {
         let now: Cell<SystemTime> = Cell::new(SystemTime::now());
         let tsc = make_tsc(fetch, || now.get());
 
-        tsc.api_endpoint(&make_client())
-            .expect("should get a valid token");
+        tsc.api_endpoint().expect("should get a valid token");
         assert_eq!(counter.get(), 1);
 
         // try and get another token - should not re-fetch as the old one
         // remains valid.
-        tsc.api_endpoint(&make_client())
-            .expect("should reuse existing token");
+        tsc.api_endpoint().expect("should reuse existing token");
         assert_eq!(counter.get(), 1);
 
         // Advance the clock.
         now.set(now.get() + Duration::new(20, 0));
 
         // We should discard our token and fetch a new one.
-        tsc.api_endpoint(&make_client()).expect("should re-fetch");
+        tsc.api_endpoint().expect("should re-fetch");
         assert_eq!(counter.get(), 2);
+    }
+
+    #[test]
+    fn test_server_url() {
+        assert_eq!(
+            fixup_server_url(
+                Url::parse("https://token.services.mozilla.com/1.0/sync/1.5").unwrap()
+            )
+            .unwrap()
+            .as_str(),
+            "https://token.services.mozilla.com/1.0/sync/1.5"
+        );
+        assert_eq!(
+            fixup_server_url(
+                Url::parse("https://token.services.mozilla.com/1.0/sync/1.5/").unwrap()
+            )
+            .unwrap()
+            .as_str(),
+            "https://token.services.mozilla.com/1.0/sync/1.5"
+        );
+        assert_eq!(
+            fixup_server_url(Url::parse("https://token.services.mozilla.com").unwrap())
+                .unwrap()
+                .as_str(),
+            "https://token.services.mozilla.com/1.0/sync/1.5"
+        );
+        assert_eq!(
+            fixup_server_url(Url::parse("https://token.services.mozilla.com/").unwrap())
+                .unwrap()
+                .as_str(),
+            "https://token.services.mozilla.com/1.0/sync/1.5"
+        );
     }
 }

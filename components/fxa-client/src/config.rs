@@ -6,6 +6,7 @@ use crate::errors::*;
 use serde_derive::*;
 use std::{cell::RefCell, sync::Arc};
 use url::Url;
+use viaduct::Request;
 
 #[derive(Deserialize)]
 struct ClientConfigurationResponse {
@@ -71,6 +72,8 @@ impl Config {
         }
     }
 
+    // FIXME
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn init(
         content_url: String,
         auth_url: String,
@@ -112,21 +115,28 @@ impl Config {
 
         let config_url =
             Url::parse(&self.content_url)?.join(".well-known/fxa-client-configuration")?;
-        let resp: ClientConfigurationResponse = reqwest::get(config_url)?.json()?;
+        let resp: ClientConfigurationResponse =
+            Request::get(config_url).send()?.require_success()?.json()?;
 
         let openid_config_url =
             Url::parse(&self.content_url)?.join(".well-known/openid-configuration")?;
-        let openid_resp: OpenIdConfigurationResponse = reqwest::get(openid_config_url)?.json()?;
+        let openid_resp: OpenIdConfigurationResponse = Request::get(openid_config_url)
+            .send()?
+            .require_success()?
+            .json()?;
 
         let remote_config = RemoteConfig {
             auth_url: format!("{}/", resp.auth_server_base_url),
             oauth_url: format!("{}/", resp.oauth_server_base_url),
             profile_url: format!("{}/", resp.profile_server_base_url),
-            token_server_endpoint_url: format!("{}/1.0/sync/1.5", resp.sync_tokenserver_base_url),
+            token_server_endpoint_url: format!("{}/", resp.sync_tokenserver_base_url),
             authorization_endpoint: openid_resp.authorization_endpoint,
             issuer: openid_resp.issuer,
             jwks_uri: openid_resp.jwks_uri,
-            token_endpoint: openid_resp.token_endpoint,
+            // TODO: bring back openid token endpoint once https://github.com/mozilla/fxa/issues/453 has been resolved
+            // and the openid response has been switched to the new endpoint.
+            // token_endpoint: openid_resp.token_endpoint,
+            token_endpoint: format!("{}/v1/oauth/token", resp.auth_server_base_url),
             userinfo_endpoint: openid_resp.userinfo_endpoint,
         };
         let rc = Arc::new(remote_config);
@@ -136,59 +146,59 @@ impl Config {
     }
 
     pub fn content_url(&self) -> Result<Url> {
-        Url::parse(&self.content_url).map_err(|e| e.into())
+        Url::parse(&self.content_url).map_err(Into::into)
     }
 
     pub fn content_url_path(&self, path: &str) -> Result<Url> {
-        self.content_url()?.join(path).map_err(|e| e.into())
+        self.content_url()?.join(path).map_err(Into::into)
     }
 
     pub fn auth_url(&self) -> Result<Url> {
-        Url::parse(&self.remote_config()?.auth_url).map_err(|e| e.into())
+        Url::parse(&self.remote_config()?.auth_url).map_err(Into::into)
     }
 
     pub fn auth_url_path(&self, path: &str) -> Result<Url> {
-        self.auth_url()?.join(path).map_err(|e| e.into())
+        self.auth_url()?.join(path).map_err(Into::into)
     }
 
     pub fn profile_url(&self) -> Result<Url> {
-        Url::parse(&self.remote_config()?.profile_url).map_err(|e| e.into())
+        Url::parse(&self.remote_config()?.profile_url).map_err(Into::into)
     }
 
     pub fn profile_url_path(&self, path: &str) -> Result<Url> {
-        self.profile_url()?.join(path).map_err(|e| e.into())
+        self.profile_url()?.join(path).map_err(Into::into)
     }
 
     pub fn oauth_url(&self) -> Result<Url> {
-        Url::parse(&self.remote_config()?.oauth_url).map_err(|e| e.into())
+        Url::parse(&self.remote_config()?.oauth_url).map_err(Into::into)
     }
 
     pub fn oauth_url_path(&self, path: &str) -> Result<Url> {
-        self.oauth_url()?.join(path).map_err(|e| e.into())
+        self.oauth_url()?.join(path).map_err(Into::into)
     }
 
     pub fn token_server_endpoint_url(&self) -> Result<Url> {
-        Url::parse(&self.remote_config()?.token_server_endpoint_url).map_err(|e| e.into())
+        Url::parse(&self.remote_config()?.token_server_endpoint_url).map_err(Into::into)
     }
 
     pub fn authorization_endpoint(&self) -> Result<Url> {
-        Url::parse(&self.remote_config()?.authorization_endpoint).map_err(|e| e.into())
+        Url::parse(&self.remote_config()?.authorization_endpoint).map_err(Into::into)
     }
 
     pub fn issuer(&self) -> Result<Url> {
-        Url::parse(&self.remote_config()?.issuer).map_err(|e| e.into())
+        Url::parse(&self.remote_config()?.issuer).map_err(Into::into)
     }
 
     pub fn jwks_uri(&self) -> Result<Url> {
-        Url::parse(&self.remote_config()?.jwks_uri).map_err(|e| e.into())
+        Url::parse(&self.remote_config()?.jwks_uri).map_err(Into::into)
     }
 
     pub fn token_endpoint(&self) -> Result<Url> {
-        Url::parse(&self.remote_config()?.token_endpoint).map_err(|e| e.into())
+        Url::parse(&self.remote_config()?.token_endpoint).map_err(Into::into)
     }
 
     pub fn userinfo_endpoint(&self) -> Result<Url> {
-        Url::parse(&self.remote_config()?.userinfo_endpoint).map_err(|e| e.into())
+        Url::parse(&self.remote_config()?.userinfo_endpoint).map_err(Into::into)
     }
 }
 
@@ -208,7 +218,7 @@ mod tests {
                 .to_string(),
             issuer: "https://dev.lcip.org/".to_string(),
             jwks_uri: "https://oauth-stable.dev.lcip.org/v1/jwks".to_string(),
-            token_endpoint: "https://oauth-stable.dev.lcip.org/v1/token".to_string(),
+            token_endpoint: "https://stable.dev.lcip.org/auth/v1/oauth/token".to_string(),
             userinfo_endpoint: "https://stable.dev.lcip.org/profile/v1/profile".to_string(),
         };
 
@@ -237,6 +247,11 @@ mod tests {
         assert_eq!(
             config.token_server_endpoint_url().unwrap().to_string(),
             "https://stable.dev.lcip.org/syncserver/token/1.0/sync/1.5"
+        );
+
+        assert_eq!(
+            config.token_endpoint().unwrap().to_string(),
+            "https://stable.dev.lcip.org/auth/v1/oauth/token"
         );
     }
 }

@@ -1,3 +1,6 @@
+#![allow(unknown_lints)]
+#![warn(rust_2018_idioms)]
+
 use criterion::{criterion_group, criterion_main, Criterion};
 use places::match_impl::{AutocompleteMatch, MatchBehavior, SearchBehavior};
 

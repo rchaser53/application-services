@@ -14,7 +14,7 @@ pub struct Error(Box<Context<ErrorKind>>);
 
 impl Fail for Error {
     #[inline]
-    fn cause(&self) -> Option<&Fail> {
+    fn cause(&self) -> Option<&dyn Fail> {
         self.0.cause()
     }
 
@@ -26,7 +26,7 @@ impl Fail for Error {
 
 impl fmt::Display for Error {
     #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&*self.0, f)
     }
 }
@@ -69,8 +69,20 @@ pub enum ErrorKind {
     #[fail(display = "No cached token for scope {}", _0)]
     NoCachedToken(String),
 
+    #[fail(display = "No cached scoped keys for scope {}", _0)]
+    NoScopedKey(String),
+
+    #[fail(display = "No stored refresh token")]
+    NoRefreshToken,
+
     #[fail(display = "Could not find a refresh token in the server response")]
     RefreshTokenNotPresent,
+
+    #[fail(display = "Action requires a prior device registration")]
+    DeviceUnregistered,
+
+    #[fail(display = "Device target is unknown (Device ID: {})", _0)]
+    UnknownTargetDevice(String),
 
     #[fail(display = "Unrecoverable server error {}", _0)]
     UnrecoverableServerError(&'static str),
@@ -79,7 +91,10 @@ pub enum ErrorKind {
     InvalidOAuthScopeValue(String),
 
     #[fail(display = "Illegal state: {}", _0)]
-    IllegalState(String),
+    IllegalState(&'static str),
+
+    #[fail(display = "Unknown command: {}", _0)]
+    UnknownCommand(String),
 
     #[fail(display = "Empty names")]
     EmptyOAuthScopeNames,
@@ -111,6 +126,9 @@ pub enum ErrorKind {
     #[fail(display = "Key agreement failed")]
     KeyAgreementFailed,
 
+    #[fail(display = "Remote key and local key mismatch")]
+    MismatchedKeys,
+
     #[fail(display = "Key import failed")]
     KeyImportFailed,
 
@@ -120,8 +138,11 @@ pub enum ErrorKind {
     #[fail(display = "Random number generation failure")]
     RngFailure,
 
-    #[fail(display = "HMAC verification failed")]
-    HmacVerifyFail,
+    #[fail(display = "HMAC mismatch")]
+    HmacMismatch,
+
+    #[fail(display = "Unsupported command: {}", _0)]
+    UnsupportedCommand(&'static str),
 
     #[fail(
         display = "Remote server error: '{}' '{}' '{}' '{}' '{}'",
@@ -135,7 +156,13 @@ pub enum ErrorKind {
         info: String,
     },
 
+    #[fail(display = "Crypto/NSS error: {}", _0)]
+    CryptoError(#[fail(cause)] rc_crypto::Error),
+
     // Basically reimplement error_chain's foreign_links. (Ugh, this sucks)
+    #[fail(display = "http-ece encryption error: {}", _0)]
+    EceError(#[fail(cause)] ece::Error),
+
     #[fail(display = "Hex decode error: {}", _0)]
     HexDecodeError(#[fail(cause)] hex::FromHexError),
 
@@ -153,20 +180,23 @@ pub enum ErrorKind {
     UTF8DecodeError(#[fail(cause)] string::FromUtf8Error),
 
     #[fail(display = "Network error: {}", _0)]
-    RequestError(#[fail(cause)] reqwest::Error),
+    RequestError(#[fail(cause)] viaduct::Error),
 
     #[fail(display = "Malformed URL error: {}", _0)]
-    MalformedUrl(#[fail(cause)] reqwest::UrlError),
+    MalformedUrl(#[fail(cause)] url::ParseError),
 
-    #[fail(display = "Header parsing error: {}", _0)]
-    HeaderParseError(#[fail(cause)] reqwest::header::ToStrError),
+    #[fail(display = "Unexpected HTTP status: {}", _0)]
+    UnexpectedStatus(#[fail(cause)] viaduct::UnexpectedStatus),
 
-    #[fail(display = "Malformed header error: {}", _0)]
-    MalformedHeader(#[fail(cause)] reqwest::header::InvalidHeaderValue),
+    #[fail(display = "Sync15 error: {}", _0)]
+    SyncError(#[fail(cause)] sync15::Error),
 
     #[cfg(feature = "browserid")]
     #[fail(display = "HAWK error: {}", _0)]
     HawkError(#[fail(cause)] SyncFailure<hawk::Error>),
+
+    #[fail(display = "Protobuf decode error: {}", _0)]
+    ProtobufDecodeError(#[fail(cause)] prost::DecodeError),
 }
 
 macro_rules! impl_from_error {
@@ -191,14 +221,17 @@ macro_rules! impl_from_error {
 }
 
 impl_from_error! {
+    (CryptoError, rc_crypto::Error),
+    (EceError, ece::Error),
     (HexDecodeError, ::hex::FromHexError),
     (Base64Decode, ::base64::DecodeError),
     (JsonError, ::serde_json::Error),
     (UTF8DecodeError, ::std::string::FromUtf8Error),
-    (RequestError, ::reqwest::Error),
-    (MalformedUrl, ::reqwest::UrlError),
-    (HeaderParseError, ::reqwest::header::ToStrError),
-    (MalformedHeader, ::reqwest::header::InvalidHeaderValue)
+    (RequestError, viaduct::Error),
+    (UnexpectedStatus, viaduct::UnexpectedStatus),
+    (MalformedUrl, url::ParseError),
+    (SyncError, ::sync15::Error),
+    (ProtobufDecodeError, prost::DecodeError)
 }
 
 #[cfg(feature = "browserid")]

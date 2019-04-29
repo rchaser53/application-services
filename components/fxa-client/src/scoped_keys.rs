@@ -2,11 +2,37 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-use crate::errors::*;
+use crate::{errors::*, FirefoxAccount};
 use byteorder::{BigEndian, ByteOrder};
-use ring::{aead, agreement, agreement::EphemeralPrivateKey, digest, rand::SecureRandom};
+use rc_crypto::digest;
+use ring::{aead, agreement, agreement::EphemeralPrivateKey, rand::SecureRandom};
+use serde_derive::*;
 use serde_json::{self, json};
 use untrusted::Input;
+
+impl FirefoxAccount {
+    pub(crate) fn get_scoped_key(&self, scope: &str) -> Result<&ScopedKey> {
+        self.state
+            .scoped_keys
+            .get(scope)
+            .ok_or_else(|| ErrorKind::NoScopedKey(scope.to_string()).into())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ScopedKey {
+    pub kty: String,
+    pub scope: String,
+    /// URL Safe Base 64 encoded key.
+    pub k: String,
+    pub kid: String,
+}
+
+impl ScopedKey {
+    pub fn key_bytes(&self) -> Result<Vec<u8>> {
+        Ok(base64::decode_config(&self.k, base64::URL_SAFE_NO_PAD)?)
+    }
+}
 
 pub struct ScopedKeysFlow {
     private_key: EphemeralPrivateKey,
@@ -18,7 +44,7 @@ pub struct ScopedKeysFlow {
 /// In the past, we chose cjose to do that job, but it added three C dependencies to build and link
 /// against: jansson, openssl and cjose itself.
 impl ScopedKeysFlow {
-    pub fn with_random_key(rng: &SecureRandom) -> Result<ScopedKeysFlow> {
+    pub fn with_random_key(rng: &dyn SecureRandom) -> Result<ScopedKeysFlow> {
         let private_key = EphemeralPrivateKey::generate(&agreement::ECDH_P256, rng)
             .map_err(|_| ErrorKind::KeyGenerationFailed)?;
         Ok(ScopedKeysFlow { private_key })
@@ -48,7 +74,7 @@ impl ScopedKeysFlow {
     }
 
     pub fn decrypt_keys_jwe(self, jwe: &str) -> Result<String> {
-        let segments: Vec<&str> = jwe.split(".").collect();
+        let segments: Vec<&str> = jwe.split('.').collect();
         let header = base64::decode_config(&segments[0], base64::URL_SAFE_NO_PAD)?;
         let protected_header: serde_json::Value = serde_json::from_slice(&header)?;
         assert_eq!(protected_header["epk"]["kty"], "EC");
@@ -92,7 +118,7 @@ impl ScopedKeysFlow {
                 buf.extend_from_slice(&to_32b_buf(apv.len() as u32));
                 buf.extend_from_slice(apv.as_bytes());
                 buf.extend_from_slice(&to_32b_buf(256));
-                Ok(digest::digest(&digest::SHA256, &buf).as_ref()[0..32].to_vec())
+                Ok(digest::digest(&digest::SHA256, &buf)?)
             },
         )?;
 
@@ -103,7 +129,7 @@ impl ScopedKeysFlow {
         let auth_tag = base64::decode_config(&segments[4], base64::URL_SAFE_NO_PAD)?;
         assert_eq!(auth_tag.len(), 128 / 8);
         assert_eq!(iv.len(), 96 / 8);
-        let opening_key = aead::OpeningKey::new(&aead::AES_256_GCM, &secret)
+        let opening_key = aead::OpeningKey::new(&aead::AES_256_GCM, &secret.as_ref())
             .map_err(|_| ErrorKind::KeyImportFailed)?;
         let mut in_out = ciphertext.to_vec();
         in_out.append(&mut auth_tag.to_vec());
@@ -112,7 +138,7 @@ impl ScopedKeysFlow {
         let aad = aead::Aad::from(segments[0].as_bytes());
         let plaintext = aead::open_in_place(&opening_key, nonce, aad, 0, &mut in_out)
             .map_err(|_| ErrorKind::AEADOpenFailure)?;
-        String::from_utf8(plaintext.to_vec()).map_err(|e| e.into())
+        String::from_utf8(plaintext.to_vec()).map_err(Into::into)
     }
 }
 

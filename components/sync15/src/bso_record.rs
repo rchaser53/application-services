@@ -70,7 +70,7 @@ impl<T> BsoRecord<T> {
     pub fn new_record(id: String, coll: String, payload: T) -> BsoRecord<T> {
         BsoRecord {
             id,
-            collection: coll.into(),
+            collection: coll,
             ttl: None,
             sortindex: None,
             modified: ServerTimestamp::default(),
@@ -178,9 +178,9 @@ pub struct Payload {
     pub data: Map<String, JsonValue>,
 }
 
-// `#[serde(skip_if)]` only allows a function (not an expression).
-// Is there a builtin way to do this?
+// TODO: Move skip_if_default from places to something shared
 #[inline]
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_false(b: &bool) -> bool {
     !*b
 }
@@ -307,7 +307,7 @@ impl From<Payload> for JsonValue {
             id,
             deleted,
         } = cleartext;
-        data.insert("id".to_string(), JsonValue::String(id.into()));
+        data.insert("id".to_string(), JsonValue::String(id));
         if deleted {
             data.insert("deleted".to_string(), JsonValue::Bool(true));
         }
@@ -370,9 +370,8 @@ impl EncryptedPayload {
     where
         for<'a> T: Deserialize<'a>,
     {
-        if !key.verify_hmac_string(&self.hmac, &self.ciphertext)? {
-            return Err(error::ErrorKind::HmacMismatch.into());
-        }
+        key.verify_hmac_string(&self.hmac, &self.ciphertext)
+            .map_err(|_| error::ErrorKind::HmacMismatch)?;
 
         let iv = base64::decode(&self.iv)?;
         let ciphertext = base64::decode(&self.ciphertext)?;
@@ -427,7 +426,7 @@ impl CleartextBso {
     where
         for<'a> T: Deserialize<'a>,
     {
-        Ok(self.try_map_payload(|payload| payload.into_record())?)
+        Ok(self.try_map_payload(Payload::into_record)?)
     }
 }
 
@@ -447,7 +446,7 @@ mod tests {
         let record: BsoRecord<EncryptedPayload> = serde_json::from_str(serialized).unwrap();
         assert_eq!(&record.id, "1234");
         assert_eq!(&record.collection, "passwords");
-        assert_eq!(record.modified.0, 12344321.0);
+        assert!((record.modified.0 - 1234_4321.0).abs() < std::f64::EPSILON);
         assert_eq!(record.sortindex, None);
         assert_eq!(&record.payload.iv, "aaaaa");
         assert_eq!(&record.payload.hmac, "bbbbb");
@@ -507,7 +506,7 @@ mod tests {
 
         assert!(keybundle
             .verify_hmac_string(&encrypted.payload.hmac, &encrypted.payload.ciphertext)
-            .unwrap());
+            .is_ok());
 
         // While we're here, check on EncryptedPayload::serialized_len
         let val_rec =
@@ -538,7 +537,7 @@ mod tests {
 
         assert!(keybundle
             .verify_hmac_string(&encrypted.payload.hmac, &encrypted.payload.ciphertext)
-            .unwrap());
+            .is_ok());
 
         // While we're here, check on EncryptedPayload::serialized_len
         let val_rec =
@@ -574,7 +573,7 @@ mod tests {
 
         assert!(keybundle
             .verify_hmac_string(&encrypted.payload.hmac, &encrypted.payload.ciphertext)
-            .unwrap());
+            .is_ok());
 
         let decrypted = encrypted.decrypt(&keybundle).unwrap();
         // We add auto fields during decryption.

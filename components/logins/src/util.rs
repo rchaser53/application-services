@@ -17,15 +17,13 @@ pub fn url_host_port(url_str: &str) -> Option<String> {
     })
 }
 
-pub fn system_time_millis_from_row(row: &Row, col_name: &str) -> Result<time::SystemTime> {
-    let time_ms = row
-        .get_checked::<_, Option<i64>>(col_name)?
-        .unwrap_or_default() as u64;
+pub fn system_time_millis_from_row(row: &Row<'_>, col_name: &str) -> Result<time::SystemTime> {
+    let time_ms = row.get::<_, Option<i64>>(col_name)?.unwrap_or_default() as u64;
     Ok(time::UNIX_EPOCH + time::Duration::from_millis(time_ms))
 }
 
 pub fn duration_ms_i64(d: time::Duration) -> i64 {
-    (d.as_secs() as i64) * 1000 + ((d.subsec_nanos() as i64) / 1_000_000)
+    (d.as_secs() as i64) * 1000 + (i64::from(d.subsec_nanos()) / 1_000_000)
 }
 
 pub fn system_time_ms_i64(t: time::SystemTime) -> i64 {

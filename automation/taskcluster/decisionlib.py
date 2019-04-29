@@ -26,8 +26,10 @@ import taskcluster
 
 # Public API
 __all__ = [
-    "CONFIG", "SHARED", "Task", "DockerWorkerTask",
-    "GenericWorkerTask", "WindowsGenericWorkerTask",
+    "CONFIG", "SHARED",
+    "Task", "DockerWorkerTask", "BeetmoverTask",
+    "build_full_task_graph", "populate_chain_of_trust_required_but_unused_files",
+    "populate_chain_of_trust_task_graph",
 ]
 
 
@@ -51,9 +53,9 @@ class Config:
         # Set in the decision task’s payload, such as defined in .taskcluster.yml
         self.task_owner = os.environ.get("TASK_OWNER")
         self.task_source = os.environ.get("TASK_SOURCE")
-        self.git_url = os.environ.get("GIT_URL")
-        self.git_ref = os.environ.get("GIT_REF")
-        self.git_sha = os.environ.get("GIT_SHA")
+        self.git_url = os.environ.get("APPSERVICES_HEAD_REPOSITORY")
+        self.git_ref = os.environ.get("APPSERVICES_HEAD_BRANCH")
+        self.git_sha = os.environ.get("APPSERVICES_HEAD_REV")
 
         # Map directory string to git sha for that directory.
         self._git_sha_for_directory = {}
@@ -78,7 +80,9 @@ class Shared:
     """
     def __init__(self):
         self.now = datetime.datetime.utcnow()
+        self.tasks_cache = {}
         self.found_or_created_indexed_tasks = {}
+        self.all_tasks = []
 
         # taskclusterProxy URLs:
         # https://docs.taskcluster.net/docs/reference/workers/docker-worker/docs/features
@@ -91,10 +95,24 @@ class Shared:
         """
         return taskcluster.stringDate(taskcluster.fromNow(offset, dateObj=self.now))
 
+    def schedule_task(self, taskId, taskDefinition):
+        # print(json.dumps(taskDefinition, indent=4, separators=(',', ': ')))
+        self.queue_service.createTask(taskId, taskDefinition)
+        print("Scheduled %s" % taskDefinition['metadata']['name'])
+        self.all_tasks.append(taskId)
+
+    def build_task_graph(self):
+        full_task_graph = {}
+
+        # TODO: Switch to async python to speed up submission
+        for task_id in self.all_tasks:
+            full_task_graph[task_id] = {
+                'task': SHARED.queue_service.task(task_id),
+            }
+        return full_task_graph
 
 CONFIG = Config()
 SHARED = Shared()
-
 
 def chaining(op, attr):
     def method(self, *args, **kwargs):
@@ -107,13 +125,15 @@ def append_to_attr(self, attr, *args): getattr(self, attr).extend(args)
 def prepend_to_attr(self, attr, *args): getattr(self, attr)[0:0] = list(args)
 def update_attr(self, attr, **kwargs): getattr(self, attr).update(kwargs)
 
+def build_full_task_graph():
+    return SHARED.build_task_graph()
 
 class Task:
     """
     A task definition, waiting to be created.
 
     Typical is to use chain the `with_*` methods to set or extend this object’s attributes,
-    then call the `crate` or `find_or_create` method to schedule a task.
+    then call the `create` or `find_or_create` method to schedule a task.
 
     This is an abstract class that needs to be specialized for different worker implementations.
     """
@@ -191,6 +211,7 @@ class Task:
         if any(r.startswith("index.") for r in routes):
             self.extra.setdefault("index", {})["expires"] = \
                 SHARED.from_now_json(self.index_and_artifacts_expire_in)
+
         dict_update_if_truthy(
             queue_payload,
             scopes=scopes,
@@ -199,8 +220,7 @@ class Task:
         )
 
         task_id = taskcluster.slugId().decode("utf8")
-        SHARED.queue_service.createTask(task_id, queue_payload)
-        print("Scheduled %s" % self.name)
+        SHARED.schedule_task(task_id, queue_payload)
         return task_id
 
     def find_or_create(self, index_path=None):
@@ -228,6 +248,7 @@ class Task:
 
         try:
             task_id = SHARED.index_service.findTask(index_path)["taskId"]
+            SHARED.all_tasks.append(task_id)
         except taskcluster.TaskclusterRestFailure as e:
             if e.status_code != 404:  # pragma: no cover
                 raise
@@ -237,275 +258,51 @@ class Task:
         SHARED.found_or_created_indexed_tasks[index_path] = task_id
         return task_id
 
-
-class GenericWorkerTask(Task):
-    """
-    Task definition for a worker type that runs the `generic-worker` implementation.
-
-    This is an abstract class that needs to be specialized for different operating systems.
-
-    <https://github.com/taskcluster/generic-worker>
-    """
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.max_run_time_minutes = 30
-        self.env = {}
-        self.mounts = []
-        self.artifacts = []
-
-    with_max_run_time_minutes = chaining(setattr, "max_run_time_minutes")
-    with_mounts = chaining(append_to_attr, "mounts")
-    with_env = chaining(update_attr, "env")
-
-    def build_command(self):  # pragma: no cover
+    def reuse_or_create(self, cache_id=None):
         """
-        Overridden by sub-classes to return the `command` property of the worker payload,
-        in the format appropriate for the operating system.
+        See if we can re-use a task with the same cache_id or
+        create a new one, this is similar as `find_or_create`
+        except that the scope of this function is limited to
+        its execution since nothing is persisted.
         """
-        raise NotImplementedError
+        task_id = SHARED.tasks_cache.get(cache_id)
+        if task_id is not None:
+            return task_id
+        task_id = self.create()
+        SHARED.tasks_cache[cache_id] = task_id
+        return task_id
+
+class BeetmoverTask(Task):
+    def __init__(self, name):
+        super().__init__(name)
+        self.provisioner_id = "scriptworker-prov-v1"
+        self.artifact_id = None
+        self.app_name = None
+        self.app_version = None
+        self.upstream_artifacts = []
+
+    with_app_name = chaining(setattr, "app_name")
+    with_app_version = chaining(setattr, "app_version")
+    with_artifact_id = chaining(setattr, "artifact_id")
+    with_upstream_artifact = chaining(append_to_attr, "upstream_artifacts")
 
     def build_worker_payload(self):
-        """
-        Return a `generic-worker` worker payload.
-
-        <https://docs.taskcluster.net/docs/reference/workers/generic-worker/docs/payload>
-        """
-        worker_payload = {
-            "command": self.build_command(),
-            "maxRunTime": self.max_run_time_minutes * 60
+        payload =  {
+            "maxRunTime": 10 * 60,
+            "releaseProperties": {
+                "appName": self.app_name,
+            },
+            "upstreamArtifacts": self.upstream_artifacts,
+            "version": self.app_version,
+            "artifact_id": self.artifact_id,
         }
-        return dict_update_if_truthy(
-            worker_payload,
-            env=self.env,
-            mounts=self.mounts,
-            artifacts=[
-                {
-                    "type": type_,
-                    "path": path,
-                    "name": "public/" + url_basename(path),
-                    "expires": SHARED.from_now_json(self.index_and_artifacts_expire_in),
-                }
-                for type_, path in self.artifacts
-            ],
-        )
 
-    def with_artifacts(self, *paths, type="file"):
-        """
-        Add each path in `paths` as a task artifact
-        that expires in `self.index_and_artifacts_expire_in`.
+        # XXX: Beetmover jobs that transfer the `forUnitTests` maven.zip need
+        # to have an additional flag set
+        if 'forUnitTests' in self.name:
+            payload['is_jar'] = True
 
-        `type` can be `"file"` or `"directory"`.
-
-        Paths are relative to the task’s home directory.
-        """
-        self.artifacts.extend((type, path) for path in paths)
-        return self
-
-    def _mount_content(self, url_or_artifact_name, task_id, sha256):
-        if task_id:
-            content = {"taskId": task_id, "artifact": url_or_artifact_name}
-        else:
-            content = {"url": url_or_artifact_name}
-        if sha256:
-            content["sha256"] = sha256
-        return content
-
-    def with_file_mount(self, url_or_artifact_name, task_id=None, sha256=None, path=None):
-        """
-        Make `generic-worker` download a file before the task starts
-        and make it available at `path` (which is relative to the task’s home directory).
-
-        If `sha256` is provided, `generic-worker` will hash the downloaded file
-        and check it against the provided signature.
-
-        If `task_id` is provided, this task will depend on that task
-        and `url_or_artifact_name` is the name of an artifact of that task.
-        """
-        return self.with_mounts({
-            "file": path or url_basename(url_or_artifact_name),
-            "content": self._mount_content(url_or_artifact_name, task_id, sha256),
-        })
-
-    def with_directory_mount(self, url_or_artifact_name, task_id=None, sha256=None, path=None):
-        """
-        Make `generic-worker` download an archive before the task starts,
-        and uncompress it at `path` (which is relative to the task’s home directory).
-
-        `url_or_artifact_name` must end in one of `.rar`, `.tar.bz2`, `.tar.gz`, or `.zip`.
-        The archive must be in the corresponding format.
-
-        If `sha256` is provided, `generic-worker` will hash the downloaded archive
-        and check it against the provided signature.
-
-        If `task_id` is provided, this task will depend on that task
-        and `url_or_artifact_name` is the name of an artifact of that task.
-        """
-        supported_formats = ["rar", "tar.bz2", "tar.gz", "zip"]
-        for fmt in supported_formats:
-            suffix = "." + fmt
-            if url_or_artifact_name.endswith(suffix):
-                return self.with_mounts({
-                    "directory": path or url_basename(url_or_artifact_name[:-len(suffix)]),
-                    "content": self._mount_content(url_or_artifact_name, task_id, sha256),
-                    "format": fmt,
-                })
-        raise ValueError(
-            "%r does not appear to be in one of the supported formats: %r"
-            % (url_or_artifact_name, ", ".join(supported_formats))
-        )  # pragma: no cover
-
-
-class WindowsGenericWorkerTask(GenericWorkerTask):
-    """
-    Task definition for a `generic-worker` task running on Windows.
-
-    Scripts are written as `.bat` files executed with `cmd.exe`.
-    """
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.scripts = []
-
-    with_script = chaining(append_to_attr, "scripts")
-    with_early_script = chaining(prepend_to_attr, "scripts")
-
-    def build_command(self):
-        return [deindent(s) for s in self.scripts]
-
-    def with_path_from_homedir(self, *paths):
-        """
-        Interpret each path in `paths` as relative to the task’s home directory,
-        and add it to the `PATH` environment variable.
-        """
-        for p in paths:
-            self.with_early_script("set PATH=%HOMEDRIVE%%HOMEPATH%\\{};%PATH%".format(p))
-        return self
-
-    def with_repo(self, sparse_checkout=None):
-        """
-        Make a shallow clone the git repository at the start of the task.
-        This uses `CONFIG.git_url`, `CONFIG.git_ref`, and `CONFIG.git_sha`,
-        and creates the clone in a `repo` directory in the task’s home directory.
-
-        If `sparse_checkout` is given, it must be a list of path patterns
-        to be used in `.git/info/sparse-checkout`.
-        See <https://git-scm.com/docs/git-read-tree#_sparse_checkout>.
-        """
-        git = """
-            git init repo
-            cd repo
-        """
-        if sparse_checkout:
-            git += """
-                git config core.sparsecheckout true
-                echo %SPARSE_CHECKOUT_BASE64% > .git\\info\\sparse.b64
-                certutil -decode .git\\info\\sparse.b64 .git\\info\\sparse-checkout
-                type .git\\info\\sparse-checkout
-            """
-            self.env["SPARSE_CHECKOUT_BASE64"] = base64.b64encode(
-                "\n".join(sparse_checkout).encode("utf-8"))
-        git += """
-            git fetch --quiet --depth 1 %GIT_URL% %GIT_REF%
-            git reset --hard %GIT_SHA%
-        """
-        return self \
-        .with_git() \
-        .with_script(git) \
-        .with_env(**git_env())
-
-    def with_git(self):
-        """
-        Make the task download `git-for-windows` and make it available for `git` commands.
-
-        This is implied by `with_repo`.
-        """
-        return self \
-        .with_path_from_homedir("git\\cmd") \
-        .with_directory_mount(
-            "https://github.com/git-for-windows/git/releases/download/" +
-                "v2.19.0.windows.1/MinGit-2.19.0-64-bit.zip",
-            sha256="424d24b5fc185a9c5488d7872262464f2facab4f1d4693ea8008196f14a3c19b",
-            path="git",
-        )
-
-    def with_rustup(self):
-        """
-        Download rustup.rs and make it available to task commands,
-        but does not download any default toolchain.
-        """
-        return self \
-        .with_path_from_homedir(".cargo\\bin") \
-        .with_early_script(
-            "%HOMEDRIVE%%HOMEPATH%\\rustup-init.exe --default-toolchain none -y"
-        ) \
-        .with_file_mount(
-            "https://static.rust-lang.org/rustup/archive/" +
-                "1.13.0/i686-pc-windows-gnu/rustup-init.exe",
-            sha256="43072fbe6b38ab38cd872fa51a33ebd781f83a2d5e83013857fab31fc06e4bf0",
-        )
-
-    def with_repacked_msi(self, url, sha256, path):
-        """
-        Download an MSI file from `url`, extract the files in it with `lessmsi`,
-        and make them available in the directory at `path` (relative to the task’s home directory).
-
-        `sha256` is required and the MSI file must have that hash.
-
-        The file extraction (and recompression in a ZIP file) is done in a separate task,
-        wich is indexed based on `sha256` and cached for `CONFIG.repacked_msi_files_expire_in`.
-
-        <https://github.com/activescott/lessmsi>
-        """
-        repack_task = (
-            WindowsGenericWorkerTask("MSI repack: " + url)
-            .with_worker_type(self.worker_type)
-            .with_max_run_time_minutes(20)
-            .with_file_mount(url, sha256=sha256, path="input.msi")
-            .with_directory_mount(
-                "https://github.com/activescott/lessmsi/releases/download/" +
-                    "v1.6.1/lessmsi-v1.6.1.zip",
-                sha256="540b8801e08ec39ba26a100c855898f455410cecbae4991afae7bb2b4df026c7",
-                path="lessmsi"
-            )
-            .with_directory_mount(
-                "https://www.7-zip.org/a/7za920.zip",
-                sha256="2a3afe19c180f8373fa02ff00254d5394fec0349f5804e0ad2f6067854ff28ac",
-                path="7zip",
-            )
-            .with_path_from_homedir("lessmsi", "7zip")
-            .with_script("""
-                lessmsi x input.msi extracted\\
-                cd extracted\\SourceDir
-                7za a repacked.zip *
-            """)
-            .with_artifacts("extracted/SourceDir/repacked.zip")
-            .with_index_and_artifacts_expire_in(CONFIG.repacked_msi_files_expire_in)
-            .find_or_create("repacked-msi." + sha256)
-        )
-        return self \
-        .with_dependencies(repack_task) \
-        .with_directory_mount("public/repacked.zip", task_id=repack_task, path=path)
-
-    def with_python2(self):
-        """
-        Make Python 2, pip, and virtualenv accessible to the task’s commands.
-
-        For Python 3, use `with_directory_mount` and the "embeddable zip file" distribution
-        from python.org.
-        You may need to remove `python37._pth` from the ZIP in order to work around
-        <https://bugs.python.org/issue34841>.
-        """
-        return self \
-        .with_repacked_msi(
-            "https://www.python.org/ftp/python/2.7.15/python-2.7.15.amd64.msi",
-            sha256="5e85f3c4c209de98480acbf2ba2e71a907fd5567a838ad4b6748c76deb286ad7",
-            path="python2"
-        ) \
-        .with_early_script("""
-            python -m ensurepip
-            pip install virtualenv==16.0.0
-        """) \
-        .with_path_from_homedir("python2", "python2\\Scripts")
-
+        return payload
 
 
 class DockerWorkerTask(Task):
@@ -518,6 +315,8 @@ class DockerWorkerTask(Task):
     """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # We use this specific version because our decision task also runs on this one.
+        # We also use that same version in docker/build.dockerfile
         self.docker_image = "ubuntu:bionic-20180821"
         self.max_run_time_minutes = 30
         self.scripts = []
@@ -525,7 +324,6 @@ class DockerWorkerTask(Task):
         self.caches = {}
         self.features = {}
         self.artifacts = []
-        self.curl_scripts_count = 0
 
     with_docker_image = chaining(setattr, "docker_image")
     with_max_run_time_minutes = chaining(setattr, "max_run_time_minutes")
@@ -549,6 +347,10 @@ class DockerWorkerTask(Task):
                 deindent("\n".join(self.scripts))
             ],
         }
+        if self.features.get("chainOfTrust"):
+            if isinstance(self.docker_image, dict):
+                cot = self.extra.setdefault("chainOfTrust", {})
+                cot.setdefault('inputs', {})['docker-image'] = self.docker_image['taskId']
         return dict_update_if_truthy(
             worker_payload,
             env=self.env,
@@ -574,17 +376,11 @@ class DockerWorkerTask(Task):
         return self
 
     def with_curl_script(self, url, file_path):
-        self.curl_scripts_count += 1
-        n = self.curl_scripts_count
         return self \
-        .with_env(**{
-            "CURL_%s_URL" % n: url,
-            "CURL_%s_PATH" % n: file_path,
-        }) \
         .with_script("""
-            mkdir -p $(dirname "$CURL_{n}_PATH")
-            curl --retry 5 --connect-timeout 10 -Lf "$CURL_{n}_URL" -o "$CURL_{n}_PATH"
-        """.format(n=n))
+            mkdir -p $(dirname {file_path})
+            curl --retry 5 --connect-timeout 10 -Lf {url} -o {file_path}
+        """.format(url=url, file_path=file_path))
 
     def with_curl_artifact_script(self, task_id, artifact_name, out_directory=""):
         return self \
@@ -607,13 +403,12 @@ class DockerWorkerTask(Task):
         return self \
         .with_env(**git_env()) \
         .with_early_script("""
-            git init repo
             cd repo
-            git fetch --quiet --depth 1 "$GIT_URL" "$GIT_REF"
-            git reset --hard "$GIT_SHA"
+            git fetch --quiet --tags "$APPSERVICES_HEAD_REPOSITORY" "$APPSERVICES_HEAD_BRANCH"
+            git reset --hard "$APPSERVICES_HEAD_REV"
         """)
 
-    def with_dockerfile(self, dockerfile):
+    def with_dockerfile(self, dockerfile, use_indexed_task=True):
         """
         Build a Docker image based on the given `Dockerfile`, and use it for this task.
 
@@ -651,15 +446,21 @@ class DockerWorkerTask(Task):
                 "servobrowser/taskcluster-bootstrap:image-builder@sha256:" \
                 "0a7d012ce444d62ffb9e7f06f0c52fedc24b68c2060711b313263367f7272d9d"
             )
-            .find_or_create("docker-image." + digest)
         )
+        if self.features.get("chainOfTrust"):
+            image_build_task.with_features("chainOfTrust")
+        task_index = "appservices-docker-image." + digest
+        if use_indexed_task:
+            image_build_task_id = image_build_task.find_or_create(task_index)
+        else:
+            image_build_task_id = image_build_task.reuse_or_create(task_index)
 
         return self \
-        .with_dependencies(image_build_task) \
+        .with_dependencies(image_build_task_id) \
         .with_docker_image({
             "type": "task-image",
             "path": "public/image.tar.lz4",
-            "taskId": image_build_task,
+            "taskId": image_build_task_id,
         })
 
 
@@ -686,9 +487,9 @@ def git_env():
     assert CONFIG.git_ref
     assert CONFIG.git_sha
     return {
-        "GIT_URL": CONFIG.git_url,
-        "GIT_REF": CONFIG.git_ref,
-        "GIT_SHA": CONFIG.git_sha,
+        "APPSERVICES_HEAD_REPOSITORY": CONFIG.git_url,
+        "APPSERVICES_HEAD_BRANCH": CONFIG.git_ref,
+        "APPSERVICES_HEAD_REV": CONFIG.git_sha,
     }
 
 def dict_update_if_truthy(d, **kwargs):
@@ -704,3 +505,21 @@ def deindent(string):
 
 def url_basename(url):
     return url.rpartition("/")[-1]
+
+def populate_chain_of_trust_required_but_unused_files():
+    # These files are needed to keep chainOfTrust happy. However,
+    # they are not needed for a-s at the moment. For more details, see:
+    # https://github.com/mozilla-releng/scriptworker/pull/209/files#r184180585
+
+    for file_names in ('actions.json', 'parameters.yml'):
+        with open(file_names, 'w') as f:
+            json.dump({}, f)    # Yaml is a super-set of JSON.
+
+
+def populate_chain_of_trust_task_graph(full_task_graph):
+    # taskgraph must follow the format:
+    # {
+    #    task_id: full_task_definition
+    # }
+    with open('task-graph.json', 'w') as f:
+        json.dump(full_task_graph, f)

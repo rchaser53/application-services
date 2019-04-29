@@ -2,7 +2,9 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-FROM ubuntu:bionic-20181018
+# We use this specific version because our decision task also runs on this one.
+# We also use that same version in decisionlib.py
+FROM ubuntu:bionic-20180821
 
 MAINTAINER Nick Alexander "nalexander@mozilla.com"
 
@@ -51,10 +53,13 @@ RUN apt-get update -qq \
                           make \
                           tclsh \
                           patch \
+                          file \
+                          libnss3-dev \
     && apt-get clean
 
 RUN pip install --upgrade pip
 RUN pip install 'taskcluster>=4,<5'
+RUN pip install pyyaml
 
 RUN locale-gen en_US.UTF-8
 
@@ -85,12 +90,12 @@ RUN curl -L https://dl.google.com/android/repository/sdk-tools-linux-${ANDROID_S
 # build OpenSSL.
 ENV ANDROID_NDK_VERSION "r15c"
 
-ENV ANDROID_NDK_HOME /build/android-ndk
+ENV ANDROID_NDK_ROOT /build/android-ndk
 
 RUN curl -L https://dl.google.com/android/repository/android-ndk-${ANDROID_NDK_VERSION}-linux-x86_64.zip > ndk.zip \
 	&& unzip -q ndk.zip -d /build \
 	&& rm ndk.zip \
-  && mv /build/android-ndk-${ANDROID_NDK_VERSION} ${ANDROID_NDK_HOME}
+  && mv /build/android-ndk-${ANDROID_NDK_VERSION} ${ANDROID_NDK_ROOT}
 
 ENV ANDROID_NDK_TOOLCHAIN_DIR /root/.android-ndk-r15c-toolchain
 ENV ANDROID_NDK_API_VERSION 21
@@ -98,8 +103,8 @@ ENV ANDROID_NDK_API_VERSION 21
 # Rust (cribbed from https://github.com/rust-lang-nursery/docker-rust/blob/ced83778ec6fea7f63091a484946f95eac0ee611/1.27.1/stretch/Dockerfile)
 
 RUN set -eux; \
-    rustArch='x86_64-unknown-linux-gnu'; rustupSha256='0077ff9c19f722e2be202698c037413099e1188c0c233c12a2297bf18e9ff6e7'; \
-    url="https://static.rust-lang.org/rustup/archive/1.14.0/${rustArch}/rustup-init"; \
+    rustArch='x86_64-unknown-linux-gnu'; rustupSha256='ce09d3de51432b34a8ff73c7aaa1edb64871b2541d2eb474441cedb8bf14c5fa'; \
+    url="https://static.rust-lang.org/rustup/archive/1.17.0/${rustArch}/rustup-init"; \
     wget "$url"; \
     echo "${rustupSha256} *rustup-init" | sha256sum -c -; \
     chmod +x rustup-init; \
@@ -110,6 +115,14 @@ ENV PATH=/root/.cargo/bin:$PATH
 
 RUN \
     curl --silent --show-error --fail --location --retry 5 --retry-delay 10 \
-        https://github.com/mozilla/sccache/releases/download/0.2.7/sccache-0.2.7-x86_64-unknown-linux-musl.tar.gz \
+        https://github.com/mozilla/sccache/releases/download/0.2.8/sccache-0.2.8-x86_64-unknown-linux-musl.tar.gz \
         | tar -xz --strip-components=1 -C /usr/local/bin/ \
-            sccache-0.2.7-x86_64-unknown-linux-musl/sccache
+            sccache-0.2.8-x86_64-unknown-linux-musl/sccache
+
+RUN \
+    curl --location --retry 10 --retry-delay 10 \
+         -o /usr/local/bin/tooltool.py \
+         https://raw.githubusercontent.com/mozilla/build-tooltool/36511dae0ead6848017e2d569b1f6f1b36984d40/tooltool.py && \
+         chmod +x /usr/local/bin/tooltool.py
+
+RUN git init repo

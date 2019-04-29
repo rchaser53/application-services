@@ -2,8 +2,6 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-#![cfg(feature = "ffi")]
-
 // This module implement the traits that make the FFI code easier to manage.
 
 use crate::{Error, ErrorKind, Login};
@@ -36,6 +34,9 @@ pub mod error_codes {
 
     /// A request to the sync server failed.
     pub const NETWORK: i32 = 6;
+
+    /// A request to the sync server failed.
+    pub const INTERRUPTED: i32 = 6;
 }
 
 fn get_code(err: &Error) -> ErrorCode {
@@ -70,6 +71,19 @@ fn get_code(err: &Error) -> ErrorCode {
             log::error!("Not a database / invalid key error");
             ErrorCode::new(error_codes::INVALID_KEY)
         }
+
+        ErrorKind::SqlError(rusqlite::Error::SqliteFailure(err, _))
+            if err.code == rusqlite::ErrorCode::OperationInterrupted =>
+        {
+            log::warn!("Operation interrupted (SQL)");
+            ErrorCode::new(error_codes::INTERRUPTED)
+        }
+
+        ErrorKind::Interrupted(_) => {
+            log::warn!("Operation interrupted (Outside SQL)");
+            ErrorCode::new(error_codes::INTERRUPTED)
+        }
+
         err => {
             log::error!("Unexpected error: {:?}", err);
             ErrorCode::new(error_codes::UNEXPECTED)

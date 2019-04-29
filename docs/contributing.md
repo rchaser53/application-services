@@ -21,7 +21,21 @@ To work on the code in this repo you will need to be familiar with
 the [Rust](https://www.rust-lang.org/) programming language.
 You can get a working rust compiler and toolchain via [rustup](https://rustup.rs/).
 
-Some components require `openssl` and `sqlcipher` in order to build correctly.
+The Network Security Suite (NSS) libraries must be available on your system for
+tests to run correctly.
+You can install them by doing the following:
+
+* On MacOS (using the [Homebrew package manager](https://brew.sh/)):
+```
+brew install nss
+brew link --force nss
+```
+* On Debian/Ubuntu:
+```
+apt-get install libnss3-dev
+```
+
+Some components also require `openssl` and `sqlcipher` in order to build correctly.
 You may be able to install these via your OS package manager, but for consistency
 we recommend using the versions included in this repo by doing the following from
 the root of your checkout:
@@ -50,6 +64,7 @@ Patches should be submitted as [pull requests](https://help.github.com/articles/
 Before submitting a PR:
 - Your code must run and pass all the automated tests before you submit your PR for review. "Work in progress" pull requests are allowed to be submitted, but should be clearly labeled as such and should not be merged until all tests pass and the code has been reviewed.
   - Run `cargo test --all` to make sure all tests still pass and no warnings are emitted.
+  - Run `cargo clippy --all-targets --all-features` to make sure that linting passes (You may need to `rustup component add clippy` first).
   - Run `cargo fmt` to ensure the code is formatted correctly.
 - Your patch should include new tests that cover your changes. It is your and your reviewer's responsibility to ensure your patch includes adequate tests.
 
@@ -57,8 +72,9 @@ When submitting a PR:
 - You agree to license your code under the project's open source license ([MPL 2.0](/LICENSE)).
 - Base your branch off the current `master` (see below for an example workflow).
 - Add both your code and new tests if relevant.
-- Run `cargo test` to make sure your code passes linting and tests.
+- Run `cargo test` and `cargo clippy` to make sure your code passes linting and tests.
 - Please do not include merge commits in pull requests; include only commits with the new relevant code.
+- Your patch must be [GPG signed](https://help.github.com/articles/managing-commit-signature-verification) to ensure the commits come from a trusted source.
 
 ## Code Review ##
 

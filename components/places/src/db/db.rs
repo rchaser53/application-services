@@ -2,65 +2,46 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-// XXXXXX - This has been cloned from logins/src/db.rs, on Thom's
-// wip-sync-sql-store branch, but with login specific code removed.
-// We should work out how to split this into a library we can reuse.
-
-use super::interrupt::{InterruptScope, PlacesInterruptHandle};
 use super::schema;
+use crate::api::places_api::ConnectionType;
 use crate::error::*;
 use rusqlite::Connection;
-use sql_support::ConnExt;
+use sql_support::{ConnExt, SqlInterruptHandle, SqlInterruptScope};
 use std::ops::Deref;
 use std::path::Path;
 
-use std::sync::{atomic::AtomicUsize, Arc};
+use std::sync::{atomic::AtomicUsize, Arc, Mutex};
 
 pub const MAX_VARIABLE_NUMBER: usize = 999;
 
+#[derive(Debug)]
 pub struct PlacesDb {
     pub db: Connection,
+    conn_type: ConnectionType,
     interrupt_counter: Arc<AtomicUsize>,
+    api_id: usize,
+    in_memory: bool,
+    pub(super) coop_tx_lock: Arc<Mutex<()>>,
 }
 
 impl PlacesDb {
-    pub fn with_connection(db: Connection, encryption_key: Option<&str>) -> Result<Self> {
-        const PAGE_SIZE: u32 = 32768;
+    pub fn with_connection(
+        db: Connection,
+        conn_type: ConnectionType,
+        api_id: usize,
+        coop_tx_lock: Arc<Mutex<()>>,
+        in_memory: bool,
+    ) -> Result<Self> {
+        let initial_pragmas = "
+            -- The value we use was taken from Desktop Firefox, and seems necessary to
+            -- help ensure good performance on autocomplete-style queries. The default value is 1024,
+            -- which the SQLcipher docs themselves say is too small and should be changed.
+            PRAGMA page_size = 32768;
 
-        // `encryption_pragmas` is both for `PRAGMA key` and for `PRAGMA page_size` / `PRAGMA
-        // cipher_page_size` (Even though nominally page_size has nothing to do with encryption, we
-        // need to set `PRAGMA cipher_page_size` for encrypted databases, and `PRAGMA page_size` for
-        // unencrypted ones).
-        //
-        // Note: Unfortunately, for an encrypted database, the page size can not be changed without
-        // requiring a data migration, so this must be done somewhat carefully. This restriction
-        // *only* exists for encrypted DBs, and unencrypted ones (even unencrypted databases using
-        // sqlcipher), don't have this limitation.
-        //
-        // The value we use (`PAGE_SIZE`) was taken from Desktop Firefox, and seems necessary to
-        // help ensure good performance on autocomplete-style queries. The default value is 1024,
-        // which the SQLcipher docs themselves say is too small and should be changed.
-        let encryption_pragmas = if let Some(key) = encryption_key {
-            format!(
-                "PRAGMA key = '{key}';
-                 PRAGMA cipher_page_size = {page_size};",
-                key = sql_support::escape_string_for_pragma(key),
-                page_size = PAGE_SIZE,
-            )
-        } else {
-            format!(
-                "PRAGMA page_size = {};
-                 -- Disable calling mlock/munlock for every malloc/free.
-                 -- In practice this results in a massive speedup, especially
-                 -- for insert-heavy workloads.
-                 PRAGMA cipher_memory_security = false;",
-                PAGE_SIZE
-            )
-        };
-
-        let initial_pragmas = format!(
-            "
-            {}
+            -- Disable calling mlock/munlock for every malloc/free.
+            -- In practice this results in a massive speedup, especially
+            -- for insert-heavy workloads.
+            PRAGMA cipher_memory_security = false;
 
             -- `temp_store = 2` is required on Android to force the DB to keep temp
             -- files in memory, since on Android there's no tmp partition. See
@@ -81,49 +62,88 @@ impl PlacesDb {
 
             -- we unconditionally want write-ahead-logging mode
             PRAGMA journal_mode=WAL;
-        ",
-            encryption_pragmas,
-        );
+        ";
 
-        db.execute_batch(&initial_pragmas)?;
+        db.execute_batch(initial_pragmas)?;
         define_functions(&db)?;
         let res = Self {
             db,
+            conn_type,
+            // The API sets this explicitly.
+            api_id,
             interrupt_counter: Arc::new(AtomicUsize::new(0)),
+            coop_tx_lock,
+            in_memory,
         };
-        // Even though we're the owner of the db, we need it to be an unchecked tx
-        // since we want to pass &PlacesDb and not &Connection to schema::init.
-        let tx = res.unchecked_transaction()?;
-        schema::init(&res)?;
-        tx.commit()?;
+        match res.conn_type() {
+            // For read-only connections, we can avoid opening a transaction,
+            // since we know we won't be migrating or initializing anything.
+            ConnectionType::ReadOnly => {}
+            _ => {
+                // Even though we're the owner of the db, we need it to be an unchecked tx
+                // since we want to pass &PlacesDb and not &Connection to schema::init.
+                let tx = res.unchecked_transaction()?;
+                schema::init(&res)?;
+                tx.commit()?;
+            }
+        }
 
         Ok(res)
     }
 
-    pub fn open(path: impl AsRef<Path>, encryption_key: Option<&str>) -> Result<Self> {
+    pub fn open(
+        path: impl AsRef<Path>,
+        conn_type: ConnectionType,
+        api_id: usize,
+        coop_tx_lock: Arc<Mutex<()>>,
+    ) -> Result<Self> {
         Ok(Self::with_connection(
-            Connection::open(path)?,
-            encryption_key,
+            Connection::open_with_flags(path, conn_type.rusqlite_flags())?,
+            conn_type,
+            api_id,
+            coop_tx_lock,
+            false,
         )?)
     }
 
-    pub fn open_in_memory(encryption_key: Option<&str>) -> Result<Self> {
+    #[cfg(test)]
+    // Useful for some tests (although most tests should use helper functions
+    // in api::places_api::test)
+    pub fn open_in_memory(conn_ty: ConnectionType) -> Result<Self> {
         Ok(Self::with_connection(
             Connection::open_in_memory()?,
-            encryption_key,
+            conn_ty,
+            0,
+            Arc::new(Mutex::new(())),
+            true,
         )?)
     }
 
-    pub fn new_interrupt_handle(&self) -> PlacesInterruptHandle {
-        PlacesInterruptHandle {
-            db_handle: self.db.get_interrupt_handle(),
-            interrupt_counter: self.interrupt_counter.clone(),
-        }
+    pub fn new_interrupt_handle(&self) -> SqlInterruptHandle {
+        SqlInterruptHandle::new(
+            self.db.get_interrupt_handle(),
+            self.interrupt_counter.clone(),
+        )
     }
 
     #[inline]
-    pub(crate) fn begin_interrupt_scope(&self) -> InterruptScope {
-        InterruptScope::new(self.interrupt_counter.clone())
+    pub fn begin_interrupt_scope(&self) -> SqlInterruptScope {
+        SqlInterruptScope::new(self.interrupt_counter.clone())
+    }
+
+    #[inline]
+    pub fn conn_type(&self) -> ConnectionType {
+        self.conn_type
+    }
+
+    #[inline]
+    pub fn api_id(&self) -> usize {
+        self.api_id
+    }
+
+    #[inline]
+    pub fn is_in_memory(&self) -> bool {
+        self.in_memory
     }
 }
 
@@ -165,6 +185,7 @@ fn define_functions(c: &Connection) -> Result<()> {
     c.create_scalar_function("autocomplete_match", 10, true, sql_fns::autocomplete_match)?;
     c.create_scalar_function("hash", -1, true, sql_fns::hash)?;
     c.create_scalar_function("now", 0, false, sql_fns::now)?;
+    c.create_scalar_function("generate_guid", 0, false, sql_fns::generate_guid)?;
     Ok(())
 }
 
@@ -172,18 +193,18 @@ mod sql_fns {
     use crate::api::matcher::{split_after_host_and_port, split_after_prefix};
     use crate::hash;
     use crate::match_impl::{AutocompleteMatch, MatchBehavior, SearchBehavior};
-    use crate::types::Timestamp;
+    use crate::types::{SyncGuid, Timestamp};
     use rusqlite::{functions::Context, types::ValueRef, Error, Result};
 
     // Helpers for define_functions
-    fn get_raw_str<'a>(ctx: &'a Context, fname: &'static str, idx: usize) -> Result<&'a str> {
+    fn get_raw_str<'a>(ctx: &'a Context<'_>, fname: &'static str, idx: usize) -> Result<&'a str> {
         ctx.get_raw(idx).as_str().map_err(|e| {
             Error::UserFunctionError(format!("Bad arg {} to '{}': {}", idx, fname, e).into())
         })
     }
 
     fn get_raw_opt_str<'a>(
-        ctx: &'a Context,
+        ctx: &'a Context<'_>,
         fname: &'static str,
         idx: usize,
     ) -> Result<Option<&'a str>> {
@@ -202,24 +223,34 @@ mod sql_fns {
     // #[inline(never)] ensures they show up in profiles.
 
     #[inline(never)]
-    pub fn hash(ctx: &Context) -> rusqlite::Result<i64> {
+    pub fn hash(ctx: &Context<'_>) -> rusqlite::Result<Option<i64>> {
         Ok(match ctx.len() {
             1 => {
-                let value = get_raw_str(ctx, "hash", 0)?;
-                hash::hash_url(value)
+                // This is a deterministic function, which means sqlite
+                // does certain optimizations which means hash() may be called
+                // with a null value even though the query prevents the null
+                // value from actually being used. As a special case, we return
+                // null when the input is NULL. We return NULL instead of zero
+                // because the hash columns are NOT NULL, so attempting to
+                // actually use the null should fail.
+                get_raw_opt_str(ctx, "hash", 0)?.map(|value| hash::hash_url(value) as i64)
             }
             2 => {
-                let value = get_raw_str(ctx, "hash", 0)?;
+                let value = get_raw_opt_str(ctx, "hash", 0)?;
                 let mode = get_raw_str(ctx, "hash", 1)?;
-                match mode {
-                    "" => hash::hash_url(&value),
-                    "prefix_lo" => hash::hash_url_prefix(&value, hash::PrefixMode::Lo),
-                    "prefix_hi" => hash::hash_url_prefix(&value, hash::PrefixMode::Hi),
-                    arg => {
-                        return Err(rusqlite::Error::UserFunctionError(format!(
-                            "`hash` second argument must be either '', 'prefix_lo', or 'prefix_hi', got {:?}.",
-                            arg).into()));
-                    }
+                if let Some(value) = value {
+                    Some(match mode {
+                        "" => hash::hash_url(&value),
+                        "prefix_lo" => hash::hash_url_prefix(&value, hash::PrefixMode::Lo),
+                        "prefix_hi" => hash::hash_url_prefix(&value, hash::PrefixMode::Hi),
+                        arg => {
+                            return Err(rusqlite::Error::UserFunctionError(format!(
+                                "`hash` second argument must be either '', 'prefix_lo', or 'prefix_hi', got {:?}.",
+                                arg).into()));
+                        }
+                    } as i64)
+                } else {
+                    None
                 }
             }
             n => {
@@ -227,11 +258,11 @@ mod sql_fns {
                     format!("`hash` expects 1 or 2 arguments, got {}.", n).into(),
                 ));
             }
-        } as i64)
+        })
     }
 
     #[inline(never)]
-    pub fn autocomplete_match(ctx: &Context) -> Result<bool> {
+    pub fn autocomplete_match(ctx: &Context<'_>) -> Result<bool> {
         let search_str = get_raw_str(ctx, "autocomplete_match", 0)?;
         let url_str = get_raw_str(ctx, "autocomplete_match", 1)?;
         let title_str = get_raw_opt_str(ctx, "autocomplete_match", 2)?.unwrap_or_default();
@@ -259,7 +290,7 @@ mod sql_fns {
     }
 
     #[inline(never)]
-    pub fn reverse_host(ctx: &Context) -> Result<String> {
+    pub fn reverse_host(ctx: &Context<'_>) -> Result<String> {
         // We reuse this memory so no need for get_raw.
         let mut host = ctx.get::<String>(0)?;
         debug_assert!(host.is_ascii(), "Hosts must be Punycoded");
@@ -276,21 +307,21 @@ mod sql_fns {
     }
 
     #[inline(never)]
-    pub fn get_prefix(ctx: &Context) -> Result<String> {
+    pub fn get_prefix(ctx: &Context<'_>) -> Result<String> {
         let href = get_raw_str(ctx, "get_prefix", 0)?;
         let (prefix, _) = split_after_prefix(&href);
         Ok(prefix.to_owned())
     }
 
     #[inline(never)]
-    pub fn get_host_and_port(ctx: &Context) -> Result<String> {
+    pub fn get_host_and_port(ctx: &Context<'_>) -> Result<String> {
         let href = get_raw_str(ctx, "get_host_and_port", 0)?;
         let (host_and_port, _) = split_after_host_and_port(&href);
         Ok(host_and_port.to_owned())
     }
 
     #[inline(never)]
-    pub fn strip_prefix_and_userinfo(ctx: &Context) -> Result<String> {
+    pub fn strip_prefix_and_userinfo(ctx: &Context<'_>) -> Result<String> {
         let href = get_raw_str(ctx, "strip_prefix_and_userinfo", 0)?;
         let (host_and_port, remainder) = split_after_host_and_port(&href);
         let mut res = String::with_capacity(host_and_port.len() + remainder.len() + 1);
@@ -300,25 +331,30 @@ mod sql_fns {
     }
 
     #[inline(never)]
-    pub fn now(_ctx: &Context) -> Result<Timestamp> {
+    pub fn now(_ctx: &Context<'_>) -> Result<Timestamp> {
         Ok(Timestamp::now())
+    }
+
+    #[inline(never)]
+    pub fn generate_guid(_ctx: &Context<'_>) -> Result<SyncGuid> {
+        Ok(SyncGuid::new())
     }
 }
 
-// Sanity check that we can create a database.
 #[cfg(test)]
 mod tests {
     use super::*;
     use rusqlite::NO_PARAMS;
 
+    // Sanity check that we can create a database.
     #[test]
     fn test_open() {
-        PlacesDb::open_in_memory(None).expect("no memory db");
+        PlacesDb::open_in_memory(ConnectionType::ReadWrite).expect("no memory db");
     }
 
     #[test]
     fn test_reverse_host() {
-        let conn = PlacesDb::open_in_memory(None).expect("no memory db");
+        let conn = PlacesDb::open_in_memory(ConnectionType::ReadOnly).expect("no memory db");
         let rev_host: String = conn
             .db
             .query_row("SELECT reverse_host('www.mozilla.org')", NO_PARAMS, |row| {

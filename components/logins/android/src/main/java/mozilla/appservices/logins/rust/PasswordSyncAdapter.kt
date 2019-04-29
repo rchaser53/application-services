@@ -1,3 +1,4 @@
+@file:Suppress("MaxLineLength")
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -11,14 +12,13 @@ import com.sun.jna.Pointer
 import com.sun.jna.PointerType
 import java.lang.reflect.Proxy
 
-
-@Suppress("FunctionNaming", "TooManyFunctions", "TooGenericExceptionThrown")
+@Suppress("FunctionNaming", "FunctionParameterNaming", "LongParameterList", "TooGenericExceptionThrown")
 internal interface PasswordSyncAdapter : Library {
     companion object {
         private val JNA_LIBRARY_NAME = {
             val libname = System.getProperty("mozilla.appservices.logins_ffi_lib_name")
             if (libname != null) {
-                Log.i("AppServices", "Using logins_ffi_lib_name: " + libname);
+                Log.i("AppServices", "Using logins_ffi_lib_name: " + libname)
                 libname
             } else {
                 "logins_ffi"
@@ -26,7 +26,7 @@ internal interface PasswordSyncAdapter : Library {
         }()
 
         internal var INSTANCE: PasswordSyncAdapter = try {
-            val lib = Native.loadLibrary(JNA_LIBRARY_NAME, PasswordSyncAdapter::class.java) as PasswordSyncAdapter
+            val lib = Native.load<PasswordSyncAdapter>(JNA_LIBRARY_NAME, PasswordSyncAdapter::class.java)
             if (JNA_LIBRARY_NAME == "logins_ffi") {
                 // Enable logcat logging if we aren't in a megazord.
                 lib.sync15_passwords_enable_logcat_logging()
@@ -35,8 +35,7 @@ internal interface PasswordSyncAdapter : Library {
         } catch (e: UnsatisfiedLinkError) {
             Proxy.newProxyInstance(
                     PasswordSyncAdapter::class.java.classLoader,
-                    arrayOf(PasswordSyncAdapter::class.java))
-            { _, _, _ ->
+                    arrayOf(PasswordSyncAdapter::class.java)) { _, _, _ ->
                 throw RuntimeException("Logins storage functionality not available (no native library)", e)
             } as PasswordSyncAdapter
         }
@@ -45,16 +44,16 @@ internal interface PasswordSyncAdapter : Library {
     fun sync15_passwords_enable_logcat_logging()
 
     fun sync15_passwords_state_new(
-            mentat_db_path: String,
-            encryption_key: String,
-            error: RustError.ByReference
+        mentat_db_path: String,
+        encryption_key: String,
+        error: RustError.ByReference
     ): LoginsDbHandle
 
     fun sync15_passwords_state_new_with_hex_key(
-            db_path: String,
-            encryption_key_bytes: ByteArray,
-            encryption_key_len: Int,
-            error: RustError.ByReference
+        db_path: String,
+        encryption_key_bytes: ByteArray,
+        encryption_key_len: Int,
+        error: RustError.ByReference
     ): LoginsDbHandle
 
     fun sync15_passwords_state_destroy(handle: LoginsDbHandle, error: RustError.ByReference)
@@ -69,12 +68,14 @@ internal interface PasswordSyncAdapter : Library {
     // return json array
     fun sync15_passwords_get_all(handle: LoginsDbHandle, error: RustError.ByReference): Pointer?
 
-    fun sync15_passwords_sync(handle: LoginsDbHandle,
-                              key_id: String,
-                              access_token: String,
-                              sync_key: String,
-                              token_server_url: String,
-                              error: RustError.ByReference)
+    fun sync15_passwords_sync(
+        handle: LoginsDbHandle,
+        key_id: String,
+        access_token: String,
+        sync_key: String,
+        token_server_url: String,
+        error: RustError.ByReference
+    )
 
     fun sync15_passwords_wipe(handle: LoginsDbHandle, error: RustError.ByReference)
     fun sync15_passwords_wipe_local(handle: LoginsDbHandle, error: RustError.ByReference)
@@ -89,6 +90,12 @@ internal interface PasswordSyncAdapter : Library {
     fun sync15_passwords_update(handle: LoginsDbHandle, existing_login_json: String, error: RustError.ByReference)
 
     fun sync15_passwords_destroy_string(p: Pointer)
+
+    fun sync15_passwords_new_interrupt_handle(handle: LoginsDbHandle, error: RustError.ByReference): RawLoginsInterruptHandle?
+    fun sync15_passwords_interrupt(handle: RawLoginsInterruptHandle, error: RustError.ByReference)
+    fun sync15_passwords_interrupt_handle_destroy(handle: RawLoginsInterruptHandle)
 }
 
-internal typealias LoginsDbHandle = Long;
+internal typealias LoginsDbHandle = Long
+
+internal class RawLoginsInterruptHandle : PointerType()

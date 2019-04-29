@@ -10,14 +10,15 @@ const DEFAULT_ASSERTION_ISSUER: &str = "127.0.0.1";
 const DEFAULT_ASSERTION_DURATION: u64 = 60 * 60 * 1000;
 
 pub fn create_assertion(
-    key_pair: &BrowserIDKeyPair,
+    key_pair: &dyn BrowserIDKeyPair,
     certificate: &str,
     audience: &str,
 ) -> Result<String> {
     let since_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("Something is very wrong.");
-    let issued_at = since_epoch.as_secs() * 1000 + since_epoch.subsec_nanos() as u64 / 1_000_000;
+    let issued_at =
+        since_epoch.as_secs() * 1000 + u64::from(since_epoch.subsec_nanos()) / 1_000_000;
     let expires_at = issued_at + DEFAULT_ASSERTION_DURATION;
     let issuer = DEFAULT_ASSERTION_ISSUER;
     create_assertion_full(
@@ -31,7 +32,7 @@ pub fn create_assertion(
 }
 
 pub fn create_assertion_full(
-    key_pair: &BrowserIDKeyPair,
+    key_pair: &dyn BrowserIDKeyPair,
     certificate: &str,
     audience: &str,
     issuer: &str,
@@ -45,7 +46,7 @@ pub fn create_assertion_full(
 }
 
 struct SignedJWTBuilder<'keypair> {
-    key_pair: &'keypair BrowserIDKeyPair,
+    key_pair: &'keypair dyn BrowserIDKeyPair,
     issuer: String,
     issued_at: u64,
     expires_at: u64,
@@ -55,7 +56,7 @@ struct SignedJWTBuilder<'keypair> {
 
 impl<'keypair> SignedJWTBuilder<'keypair> {
     fn new(
-        key_pair: &'keypair BrowserIDKeyPair,
+        key_pair: &'keypair dyn BrowserIDKeyPair,
         issuer: &str,
         issued_at: u64,
         expires_at: u64,
@@ -105,7 +106,7 @@ impl<'keypair> SignedJWTBuilder<'keypair> {
     }
 }
 
-fn encode_and_sign(payload: &str, key_pair: &BrowserIDKeyPair) -> Result<String> {
+fn encode_and_sign(payload: &str, key_pair: &dyn BrowserIDKeyPair) -> Result<String> {
     let headers_str = json!({"alg": key_pair.get_algo()}).to_string();
     let encoded_header = base64::encode_config(headers_str.as_bytes(), base64::URL_SAFE_NO_PAD);
     let encoded_payload = base64::encode_config(payload.as_bytes(), base64::URL_SAFE_NO_PAD);
@@ -127,12 +128,12 @@ mod tests {
         issuer: &str,
         issued_at: u64,
         expires_at: u64,
-        key_pair: &BrowserIDKeyPair,
+        key_pair: &dyn BrowserIDKeyPair,
     ) -> Result<String> {
         let principal = json!({ "email": email });
         let payload = json!({
-          "principal": principal,
-          "public-key": serialized_public_key
+            "principal": principal,
+            "public-key": serialized_public_key
         });
         Ok(
             SignedJWTBuilder::new(key_pair, issuer, issued_at, expires_at)
@@ -141,8 +142,8 @@ mod tests {
         )
     }
 
-    fn decode(token: &str, key_pair: &BrowserIDKeyPair) -> Result<String> {
-        let segments: Vec<&str> = token.split(".").collect();
+    fn decode(token: &str, key_pair: &dyn BrowserIDKeyPair) -> Result<String> {
+        let segments: Vec<&str> = token.split('.').collect();
         let message = format!("{}.{}", &segments[0], &segments[1]);
         let message_bytes = message.as_bytes();
         let signature = base64::decode_config(&segments[2], base64::URL_SAFE_NO_PAD)?;
@@ -151,13 +152,13 @@ mod tests {
             return Err(ErrorKind::JWTSignatureValidationFailed.into());
         }
         let payload = base64::decode_config(&segments[1], base64::URL_SAFE_NO_PAD)?;
-        String::from_utf8(payload).map_err(|e| e.into())
+        String::from_utf8(payload).map_err(Into::into)
     }
 
     // These tests are copied directly from Firefox for Android's TestJSONWebTokenUtils.
     // They could probably be improved a lot.
 
-    fn do_test_encode_decode(key_pair: &BrowserIDKeyPair) {
+    fn do_test_encode_decode(key_pair: &dyn BrowserIDKeyPair) {
         let payload = json!({"key": "value"}).to_string();
 
         let token = encode_and_sign(&payload, key_pair).unwrap();
@@ -187,7 +188,7 @@ mod tests {
 
         let issuer = "127.0.0.1";
         let audience = "http://localhost:8080";
-        let iat: u64 = 1352995809210;
+        let iat: u64 = 1_352_995_809_210;
         let dur: u64 = 60 * 60 * 1000;
         let exp: u64 = iat + dur;
 

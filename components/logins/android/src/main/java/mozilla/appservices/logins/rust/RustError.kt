@@ -6,12 +6,20 @@ package mozilla.appservices.logins.rust
 
 import com.sun.jna.Pointer
 import com.sun.jna.Structure
-import mozilla.appservices.logins.*
-import java.util.Arrays
+import mozilla.appservices.logins.IdCollisionException
+import mozilla.appservices.logins.InvalidKeyException
+import mozilla.appservices.logins.InvalidRecordException
+import mozilla.appservices.logins.LoginsStorageException
+import mozilla.appservices.logins.NoSuchRecordException
+import mozilla.appservices.logins.RequestFailedException
+import mozilla.appservices.logins.SyncAuthInvalidException
+import mozilla.appservices.logins.getAndConsumeRustString
+import mozilla.appservices.logins.getRustString
 
 /**
  * This should be considered private, but it needs to be public for JNA.
  */
+@Structure.FieldOrder("code", "message")
 open class RustError : Structure() {
 
     class ByReference : RustError(), Structure.ByReference
@@ -19,24 +27,21 @@ open class RustError : Structure() {
     @JvmField var code: Int = 0
     @JvmField var message: Pointer? = null
 
-    init {
-        read()
-    }
-
     /**
      * Does this represent failure?
      */
     fun isFailure(): Boolean {
-        return code != 0;
+        return code != 0
     }
 
+    @Suppress("ReturnCount", "TooGenericExceptionThrown")
     fun intoException(): LoginsStorageException {
         if (!isFailure()) {
             // It's probably a bad idea to throw here! We're probably leaking something if this is
             // ever hit! (But we shouldn't ever hit it?)
-            throw RuntimeException("[Bug] intoException called on non-failure!");
+            throw RuntimeException("[Bug] intoException called on non-failure!")
         }
-        val message = this.consumeErrorMessage();
+        val message = this.consumeErrorMessage()
         when (code) {
             1 -> return SyncAuthInvalidException(message)
             2 -> return NoSuchRecordException(message)
@@ -56,7 +61,7 @@ open class RustError : Structure() {
         val result = this.message?.getAndConsumeRustString()
         this.message = null
         if (result == null) {
-            throw NullPointerException("consumeErrorMessage called with null message!");
+            throw NullPointerException("consumeErrorMessage called with null message!")
         }
         return result
     }
@@ -72,9 +77,5 @@ open class RustError : Structure() {
      */
     fun getMessage(): String? {
         return this.message?.getRustString()
-    }
-
-    override fun getFieldOrder(): List<String> {
-        return Arrays.asList("code", "message")
     }
 }

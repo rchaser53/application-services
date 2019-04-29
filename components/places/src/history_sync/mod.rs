@@ -14,7 +14,7 @@ pub mod store;
 const MAX_INCOMING_PLACES: usize = 5000;
 const MAX_OUTGOING_PLACES: usize = 5000;
 const MAX_VISITS: usize = 20;
-pub const HISTORY_TTL: u32 = 5184000; // 60 days in milliseconds
+pub const HISTORY_TTL: u32 = 5_184_000; // 60 days in milliseconds
 
 /// Visit timestamps on the server are *microseconds* since the epoch.
 #[derive(
@@ -39,14 +39,16 @@ impl From<Timestamp> for ServerVisitTimestamp {
 impl From<SystemTime> for ServerVisitTimestamp {
     #[inline]
     fn from(st: SystemTime) -> Self {
-        let d = st.duration_since(UNIX_EPOCH).unwrap(); // hrmph - unwrap doesn't seem ideal
-        ServerVisitTimestamp((d.as_secs() as u64) * 1_000_000 + ((d.subsec_nanos() as u64) / 1_000))
+        let d = st.duration_since(UNIX_EPOCH).unwrap_or_default();
+        ServerVisitTimestamp(
+            (d.as_secs() as u64) * 1_000_000 + (u64::from(d.subsec_nanos()) / 1_000),
+        )
     }
 }
 
 impl fmt::Display for ServerVisitTimestamp {
     #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
 }

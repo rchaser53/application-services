@@ -6,7 +6,7 @@ pub use crate::http_client::ProfileResponse as Profile;
 use crate::{errors::*, scopes, util, CachedResponse, FirefoxAccount};
 
 // A cached profile response is considered fresh for `PROFILE_FRESHNESS_THRESHOLD` ms.
-const PROFILE_FRESHNESS_THRESHOLD: u64 = 120000; // 2 minutes
+const PROFILE_FRESHNESS_THRESHOLD: u64 = 120_000; // 2 minutes
 
 impl FirefoxAccount {
     /// Fetch the profile for the user.
@@ -17,7 +17,6 @@ impl FirefoxAccount {
     /// * `ignore_cache` - If set to true, bypass the in-memory cache
     /// and fetch the entire profile data from the server.
     pub fn get_profile(&mut self, ignore_cache: bool) -> Result<Profile> {
-        let profile_access_token = self.get_access_token(scopes::PROFILE)?.token;
         let mut etag = None;
         if let Some(ref cached_profile) = self.profile_cache {
             if !ignore_cache && util::now() < cached_profile.cached_at + PROFILE_FRESHNESS_THRESHOLD
@@ -26,6 +25,7 @@ impl FirefoxAccount {
             }
             etag = Some(cached_profile.etag.clone());
         }
+        let profile_access_token = self.get_access_token(scopes::PROFILE)?.token;
         match self
             .client
             .profile(&self.state.config, &profile_access_token, etag)?
@@ -40,13 +40,23 @@ impl FirefoxAccount {
                 }
                 Ok(response_and_etag.response)
             }
-            None => match self.profile_cache {
-                Some(ref cached_profile) => Ok(cached_profile.response.clone()),
-                None => Err(ErrorKind::UnrecoverableServerError(
-                    "Got a 304 without having sent an eTag.",
-                )
-                .into()),
-            },
+            None => {
+                match self.profile_cache.take() {
+                    Some(ref cached_profile) => {
+                        // Update `cached_at` timestamp.
+                        self.profile_cache.replace(CachedResponse {
+                            response: cached_profile.response.clone(),
+                            cached_at: util::now(),
+                            etag: cached_profile.etag.clone(),
+                        });
+                        Ok(cached_profile.response.clone())
+                    }
+                    None => Err(ErrorKind::UnrecoverableServerError(
+                        "Got a 304 without having sent an eTag.",
+                    )
+                    .into()),
+                }
+            }
         }
     }
 }
@@ -101,6 +111,40 @@ mod tests {
             } else {
                 panic!("Not implemented yet")
             }
+        }
+        fn pending_commands(
+            &self,
+            _: &Config,
+            _: &str,
+            _: u64,
+            _: Option<u64>,
+        ) -> Result<PendingCommandsResponse> {
+            unimplemented!("Not implemented yet")
+        }
+        fn invoke_command(
+            &self,
+            _: &Config,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> Result<()> {
+            unimplemented!("Not implemented yet")
+        }
+        fn devices(&self, _: &Config, _: &str) -> Result<Vec<GetDeviceResponse>> {
+            unimplemented!("Not implemented yet")
+        }
+        fn update_device(
+            &self,
+            _: &Config,
+            _: &str,
+            _: DeviceUpdateRequest<'_>,
+        ) -> Result<UpdateDeviceResponse> {
+            unimplemented!("Not implemented yet")
+        }
+
+        fn destroy_device(&self, _: &Config, _: &str, _: &str) -> Result<()> {
+            unimplemented!("Not implemented yet")
         }
     }
 

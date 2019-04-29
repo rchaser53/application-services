@@ -7,10 +7,9 @@ package mozilla.appservices.fxaclient.rust
 import com.sun.jna.Pointer
 import com.sun.jna.Structure
 import mozilla.appservices.fxaclient.FxaException
-import mozilla.appservices.fxaclient.FxaException.*
 import mozilla.appservices.fxaclient.getAndConsumeRustString
-import java.util.Arrays
 
+@Structure.FieldOrder("code", "message")
 internal open class RustError : Structure() {
 
     class ByReference : RustError(), Structure.ByReference
@@ -18,38 +17,35 @@ internal open class RustError : Structure() {
     @JvmField var code: Int = 0
     @JvmField var message: Pointer? = null
 
-    init {
-        read()
-    }
-
     /**
      * Does this represent success?
      */
     fun isSuccess(): Boolean {
-        return code == 0;
+        return code == 0
     }
 
     /**
      * Does this represent failure?
      */
     fun isFailure(): Boolean {
-        return code != 0;
+        return code != 0
     }
 
+    @Suppress("ReturnCount", "TooGenericExceptionThrown")
     fun intoException(): FxaException {
         if (!isFailure()) {
             // It's probably a bad idea to throw here! We're probably leaking something if this is
             // ever hit! (But we shouldn't ever hit it?)
-            throw RuntimeException("[Bug] intoException called on non-failure!");
+            throw RuntimeException("[Bug] intoException called on non-failure!")
         }
-        val message = this.consumeErrorMessage();
+        val message = this.consumeErrorMessage()
         when (code) {
-            3 -> return Network(message)
-            2 -> return Unauthorized(message)
-            -1 -> return Panic(message)
+            3 -> return FxaException.Network(message)
+            2 -> return FxaException.Unauthorized(message)
+            -1 -> return FxaException.Panic(message)
             // Note: `1` is used as a generic catch all, but we
             // might as well handle the others the same way.
-            else -> return Unspecified(message)
+            else -> return FxaException.Unspecified(message)
         }
     }
 
@@ -60,11 +56,11 @@ internal open class RustError : Structure() {
     fun consumeErrorMessage(): String {
         val result = this.getMessage()
         if (this.message != null) {
-            LibFxAFFI.INSTANCE.fxa_str_free(this.message!!);
+            LibFxAFFI.INSTANCE.fxa_str_free(this.message!!)
             this.message = null
         }
         if (result == null) {
-            throw NullPointerException("consumeErrorMessage called with null message!");
+            throw NullPointerException("consumeErrorMessage called with null message!")
         }
         return result
     }
@@ -80,9 +76,5 @@ internal open class RustError : Structure() {
      */
     fun getMessage(): String? {
         return this.message?.getString(0, "utf8")
-    }
-
-    override fun getFieldOrder(): List<String> {
-        return Arrays.asList("code", "message")
     }
 }

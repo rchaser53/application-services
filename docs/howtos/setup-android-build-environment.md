@@ -19,7 +19,7 @@ may need to repeat some steps (eg, rust updates should be done periodically)
 
 At the end of this process you should have the following environment variables set up.
 
-- `NDK_HOME`
+- `ANDROID_NDK_ROOT`
 - `ANDROID_NDK_TOOLCHAIN_DIR`
 - `ANDROID_NDK_API_VERSION`
 - `ANDROID_HOME`
@@ -32,11 +32,11 @@ a rc file or similar so they persist between reboots etc.
    (yes, this sucks, but newer versions don't understand the `--deprecated-headers`
    argument required to build OpenSSL against a v21 toolchain).
     - Extract it, put it somewhere (`$HOME/.android-ndk-r15c` is a reasonable
-      choice, but it doesn't matter), and set `NDK_HOME` to this location.
+      choice, but it doesn't matter), and set `ANDROID_NDK_ROOT` to this location.
 
 2. Install `rustup` from https://rustup.rs:
     - If you already have it, run `rustup update`
-    - Run `rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android`
+    - Run `rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android`
     - Run `rustup toolchain add beta` (TODO: this no longer appears necessary).
 
 3. Ensure your clone of `mozilla/application-services` is up to date.
@@ -46,7 +46,7 @@ a rc file or similar so they persist between reboots etc.
         - `mkdir -p ~/.ndk-standalone-toolchains`
         - `export ANDROID_NDK_TOOLCHAIN_DIR=$HOME/.ndk-standalone-toolchains`
     - `cd path/to/application-services/libs`
-    - `./setup_toolchains_local.sh $NDK_HOME`
+    - `./setup_toolchains_local.sh $ANDROID_NDK_ROOT`
         - Say yes if/when prompted.
         - When this is done, it should have set `$ANDROID_NDK_API_VERSION` (to 21),
           but you should add this to an rcfile as above.
@@ -64,11 +64,11 @@ a rc file or similar so they persist between reboots etc.
 7. Build openssl and sqlcipher
     - `cd path/to/application-services/libs` (Same dir you were just in for step 4)
     - `./build-all.sh android` (Go make some coffee or something, this will take
-       some time as it has to compile sqlcipher and openssl for x86, arm, and arm64).
+       some time as it has to compile sqlcipher and openssl for x86, x86_64, arm, and arm64).
     - Note that if something goes wrong here
         - Check all environment variables mentions above are set and correct.
         - The following directories should exist, and point to standalone NDK
-          toolchains `$ANDROID_NDK_TOOLCHAIN_DIR/{x86,arm,arm64}-$ANDROID_NDK_API_VERSION`.
+          toolchains `$ANDROID_NDK_TOOLCHAIN_DIR/{x86,x86_64,arm,arm64}-$ANDROID_NDK_API_VERSION`.
 
 ## Building
 
@@ -115,6 +115,7 @@ with sub-directories for each Android architecture. For example, after executing
 you will find:
 
     target/aarch64-linux-android/release/libplaces_ffi.so
+    target/x86_64-linux-android/release/libplaces_ffi.so
     target/i686-linux-android/release/libplaces_ffi.so
     target/armv7-linux-androideabi/release/libplaces_ffi.so
 

@@ -12,12 +12,12 @@ type State = StateV2;
 
 pub(crate) fn state_from_json(data: &str) -> Result<State> {
     let stored_state: PersistedState = serde_json::from_str(data)?;
-    return upgrade_state(stored_state);
+    upgrade_state(stored_state)
 }
 
 pub(crate) fn state_to_json(state: &State) -> Result<String> {
     let state = PersistedState::V2(state.clone());
-    serde_json::to_string(&state).map_err(|e| e.into())
+    serde_json::to_string(&state).map_err(Into::into)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -29,10 +29,10 @@ enum PersistedState {
 }
 
 fn upgrade_state(in_state: PersistedState) -> Result<State> {
-    return match in_state {
+    match in_state {
         PersistedState::V1(state) => state.into(),
         PersistedState::V2(state) => Ok(state),
-    };
+    }
 }
 
 // Migrations
@@ -63,7 +63,7 @@ impl From<StateV1> for Result<StateV2> {
                 token: token.refresh_token.clone().expect(
                     "all_refresh_tokens should only contain access tokens with refresh tokens",
                 ),
-                scopes: HashSet::from_iter(token.scopes.iter().map(|s| s.to_string())),
+                scopes: HashSet::from_iter(token.scopes.iter().map(ToString::to_string)),
             });
         Ok(StateV2 {
             config: Config::init(
@@ -84,6 +84,9 @@ impl From<StateV1> for Result<StateV2> {
             login_state: super::login_sm::LoginState::Unknown,
             refresh_token,
             scoped_keys: all_scoped_keys,
+            last_handled_command: None,
+            commands_data: HashMap::new(),
+            device_capabilities: HashSet::new(),
         })
     }
 }
@@ -145,10 +148,7 @@ mod tests {
             .scopes
             .contains("https://identity.mozilla.com/apps/lockbox"));
         assert_eq!(state.scoped_keys.len(), 2);
-        let oldsync_key = state
-            .scoped_keys
-            .get("https://identity.mozilla.com/apps/oldsync")
-            .unwrap();
+        let oldsync_key = &state.scoped_keys["https://identity.mozilla.com/apps/oldsync"];
         assert_eq!(oldsync_key.kid, "1542236016429-Ox1FbJfFfwTe5t-xq4v2hQ");
         assert_eq!(oldsync_key.k, "kMtwpVC0ZaYFJymPza8rXK_0CgCp3KMwRStwGfBRBDtL6hXRDVJgQFaoOQ2dimw0Bko5WVv2gNTy7RX5zFYZHg");
         assert_eq!(oldsync_key.kty, "oct");
@@ -156,10 +156,8 @@ mod tests {
             oldsync_key.scope,
             "https://identity.mozilla.com/apps/oldsync"
         );
-        let lockbox_key = state
-            .scoped_keys
-            .get("https://identity.mozilla.com/apps/lockbox")
-            .unwrap();
+        let lockbox_key = &state.scoped_keys["https://identity.mozilla.com/apps/lockbox"];
+
         assert_eq!(lockbox_key.kid, "1231014287-KDVj0DFaO3wGpPJD8oPwVg");
         assert_eq!(lockbox_key.k, "Qk4K4xF2PgQ6XvBXW8X7B7AWwWgW2bHQov9NHNd4v-k");
         assert_eq!(lockbox_key.kty, "oct");

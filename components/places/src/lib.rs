@@ -2,12 +2,15 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+#![allow(unknown_lints)]
+#![warn(rust_2018_idioms)]
+
 pub mod api;
 pub mod error;
 pub mod types;
 // Making these all pub for now while we flesh out the API.
+pub mod bookmark_sync;
 pub mod db;
-#[cfg(feature = "ffi")]
 pub mod ffi;
 pub mod frecency;
 pub mod hash;
@@ -16,16 +19,21 @@ pub mod history_sync;
 pub mod match_impl;
 pub mod observation;
 pub mod storage;
+#[cfg(test)]
+mod tests;
 mod util;
 mod valid_guid;
 
 pub mod msg_types {
-    use prost_derive::Message;
     include!(concat!(env!("OUT_DIR"), "/msg_types.rs"));
 }
 
 pub use crate::api::apply_observation;
-pub use crate::db::{PlacesDb, PlacesInterruptHandle};
+#[cfg(test)]
+pub use crate::api::places_api::test;
+pub use crate::api::places_api::{ConnectionType, PlacesApi};
+
+pub use crate::db::PlacesDb;
 pub use crate::error::*;
 pub use crate::observation::VisitObservation;
 pub use crate::storage::PageInfo;

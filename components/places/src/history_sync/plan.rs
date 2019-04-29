@@ -5,6 +5,7 @@
 use super::record::{HistoryRecord, HistoryRecordVisit, HistorySyncRecord};
 use super::{HISTORY_TTL, MAX_OUTGOING_PLACES, MAX_VISITS};
 use crate::api::history::can_add_url;
+use crate::db::PlacesDb;
 use crate::error::*;
 use crate::storage::history::history_sync::{
     apply_synced_deletion, apply_synced_reconciliation, apply_synced_visits, fetch_outgoing,
@@ -12,11 +13,10 @@ use crate::storage::history::history_sync::{
 };
 use crate::types::{SyncGuid, Timestamp, VisitTransition};
 use crate::valid_guid::is_valid_places_guid;
-use rusqlite::Connection;
+use interrupt::Interruptee;
 use serde_json;
-use sql_support::ConnExt;
 use std::collections::HashSet;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use sync15::telemetry;
 use sync15::{IncomingChangeset, OutgoingChangeset, Payload};
 use url::Url;
@@ -27,7 +27,7 @@ use url::Url;
 // XXX - there's probably a case to be made for this being, say, 5 years ago -
 // then all requests earlier than that are collapsed into a single visit at
 // this timestamp.
-const EARLIEST_TIMESTAMP: Timestamp = Timestamp(727747200000);
+const EARLIEST_TIMESTAMP: Timestamp = Timestamp(727_747_200_000);
 
 /// Clamps a history visit date between the current date and the earliest
 /// sensible date.
@@ -39,7 +39,7 @@ fn clamp_visit_date(visit_date: Timestamp) -> Timestamp {
     if visit_date < EARLIEST_TIMESTAMP {
         return EARLIEST_TIMESTAMP;
     }
-    return visit_date;
+    visit_date
 }
 
 /// This is the action we will take *locally* for each incoming record.
@@ -67,11 +67,7 @@ pub enum IncomingPlan {
     Reconciled,
 }
 
-fn plan_incoming_record(
-    conn: &Connection,
-    record: HistoryRecord,
-    max_visits: usize,
-) -> IncomingPlan {
+fn plan_incoming_record(conn: &PlacesDb, record: HistoryRecord, max_visits: usize) -> IncomingPlan {
     let url = match Url::parse(&record.hist_uri) {
         Ok(u) => u,
         Err(e) => return IncomingPlan::Invalid(e.into()),
@@ -87,12 +83,12 @@ fn plan_incoming_record(
                 return IncomingPlan::Skip;
             }
         }
-        Err(e) => return IncomingPlan::Failed(e.into()),
+        Err(e) => return IncomingPlan::Failed(e),
     }
     // Let's get what we know about it, if anything - last 20, like desktop?
     let visit_tuple = match fetch_visits(conn, &url, max_visits) {
         Ok(v) => v,
-        Err(e) => return IncomingPlan::Failed(e.into()),
+        Err(e) => return IncomingPlan::Failed(e),
     };
 
     // This all seems more messy than it should be - struggling to find the
@@ -119,7 +115,7 @@ fn plan_incoming_record(
             Some(t) => t,
             None => continue,
         };
-        let date_use = clamp_visit_date(visit.visit_date.into());
+        let date_use = clamp_visit_date(visit.visit_date);
         cur_visit_map.insert((transition, date_use));
     }
     // If we already have MAX_RECORDS visits, then we will ignore incoming
@@ -158,7 +154,7 @@ fn plan_incoming_record(
     // Now we need to check the other attributes.
     // Check if we should update title? For now, assume yes. It appears
     // as though desktop always updates it.
-    if guid_changed || to_apply.len() != 0 {
+    if guid_changed || !to_apply.is_empty() {
         let new_title = Some(record.title);
         IncomingPlan::Apply {
             url: url.clone(),
@@ -171,13 +167,15 @@ fn plan_incoming_record(
 }
 
 pub fn apply_plan(
-    conn: &Connection,
+    db: &PlacesDb,
     inbound: IncomingChangeset,
     telem: &mut telemetry::EngineIncoming,
+    interruptee: &impl Interruptee,
 ) -> Result<OutgoingChangeset> {
     // for a first-cut, let's do this in the most naive way possible...
     let mut plans: Vec<(SyncGuid, IncomingPlan)> = Vec::with_capacity(inbound.changes.len());
     for incoming in inbound.changes {
+        interruptee.err_if_interrupted()?;
         let item = match HistorySyncRecord::from_payload(incoming.0) {
             Ok(item) => item,
             Err(e) => {
@@ -189,19 +187,18 @@ pub fn apply_plan(
             }
         };
         let plan = match item.record {
-            Some(record) => plan_incoming_record(conn, record, MAX_VISITS),
+            Some(record) => plan_incoming_record(db, record, MAX_VISITS),
             None => IncomingPlan::Delete,
         };
         let guid = item.guid.clone();
         plans.push((guid, plan));
     }
 
-    // this 1000 duration should probably be a constant somewhere - it doesn't
-    // seem likely that different call-sites would use different values.
-    let mut tx = conn.time_chunked_transaction(Duration::from_millis(1000))?;
+    let mut tx = db.begin_transaction()?;
 
     let mut outgoing = OutgoingChangeset::new("history".into(), inbound.timestamp);
     for (guid, plan) in plans {
+        interruptee.err_if_interrupted()?;
         tx.maybe_commit()?;
         match &plan {
             IncomingPlan::Skip => {
@@ -222,7 +219,7 @@ pub fn apply_plan(
             }
             IncomingPlan::Delete => {
                 log::trace!("incoming: deleting {:?}", guid);
-                apply_synced_deletion(&conn, &guid)?;
+                apply_synced_deletion(&db, &guid)?;
                 telem.applied(1);
             }
             IncomingPlan::Apply {
@@ -237,24 +234,24 @@ pub fn apply_plan(
                     new_title,
                     visits
                 );
-                apply_synced_visits(&conn, &guid, &url, new_title, visits)?;
+                apply_synced_visits(&db, &guid, &url, new_title, visits)?;
                 telem.applied(1);
             }
             IncomingPlan::Reconciled => {
                 telem.reconciled(1);
                 log::trace!("incoming: reconciled {:?}", guid);
-                apply_synced_reconciliation(&conn, &guid)?;
+                apply_synced_reconciliation(&db, &guid)?;
             }
         };
     }
-    finish_incoming(&conn)?;
+    finish_incoming(&db)?;
     tx.commit()?;
     // It might make sense for fetch_outgoing to manage its own
-    // time_chunked_transaction - even though doesn't seem a large bottleneck
+    // begin_transaction - even though doesn't seem a large bottleneck
     // at this time, the fact we hold a single transaction for the entire call
     // really is used only for performance, so it's certainly a candidate.
-    let tx = conn.unchecked_transaction()?;
-    let mut out_infos = fetch_outgoing(conn, MAX_OUTGOING_PLACES, MAX_VISITS)?;
+    let tx = db.begin_transaction()?;
+    let mut out_infos = fetch_outgoing(db, MAX_OUTGOING_PLACES, MAX_VISITS)?;
 
     for (guid, out_record) in out_infos.drain() {
         let payload = match out_record {
@@ -270,9 +267,9 @@ pub fn apply_plan(
     Ok(outgoing)
 }
 
-pub fn finish_plan(conn: &Connection) -> Result<()> {
-    let tx = conn.unchecked_transaction()?;
-    finish_outgoing(conn)?;
+pub fn finish_plan(db: &PlacesDb) -> Result<()> {
+    let tx = db.begin_transaction()?;
+    finish_outgoing(db)?;
     log::trace!("Committing final sync plan");
     tx.commit()?;
     Ok(())
@@ -282,12 +279,14 @@ pub fn finish_plan(conn: &Connection) -> Result<()> {
 mod tests {
     use super::*;
     use crate::api::matcher::{search_frecent, SearchParams};
+    use crate::api::places_api::ConnectionType;
     use crate::db::PlacesDb;
     use crate::history_sync::ServerVisitTimestamp;
     use crate::observation::VisitObservation;
     use crate::storage::history::history_sync::fetch_visits;
     use crate::storage::history::{apply_observation, delete_place_by_guid, url_to_guid};
     use crate::types::{SyncStatus, Timestamp};
+    use interrupt::NeverInterrupts;
     use serde_json::json;
     use sql_support::ConnExt;
     use std::time::Duration;
@@ -304,13 +303,12 @@ mod tests {
         let result: Result<Option<u32>> = conn.try_query_row(
             "SELECT COUNT(*) from moz_places_tombstones;",
             &[],
-            |row| Ok(row.get_checked::<_, u32>(0)?.clone()),
+            |row| Ok(row.get::<_, u32>(0)?),
             true,
         );
         result
             .expect("should have worked")
             .expect("should have got a value")
-            .into()
     }
 
     fn get_sync(conn: &PlacesDb, url: &Url) -> (SyncStatus, u32) {
@@ -321,8 +319,8 @@ mod tests {
             &[(":url", &url.clone().into_string())],
             |row| {
                 Ok((
-                    SyncStatus::from_u8(row.get_checked::<_, u8>(0)?),
-                    row.get_checked::<_, u32>(1)?,
+                    SyncStatus::from_u8(row.get::<_, u8>(0)?),
+                    row.get::<_, u32>(1)?,
                 ))
             },
             true,
@@ -330,15 +328,14 @@ mod tests {
         guid_result
             .expect("should have worked")
             .expect("should have got values")
-            .into()
     }
 
     #[test]
     fn test_invalid_guid() -> Result<()> {
         let _ = env_logger::try_init();
-        let conn = PlacesDb::open_in_memory(None)?;
+        let conn = PlacesDb::open_in_memory(ConnectionType::Sync)?;
         let record = HistoryRecord {
-            id: SyncGuid("foo".to_string()),
+            id: "foo".into(),
             title: "title".into(),
             hist_uri: "http://example.com".into(),
             sortindex: 0,
@@ -356,9 +353,9 @@ mod tests {
     #[test]
     fn test_invalid_url() -> Result<()> {
         let _ = env_logger::try_init();
-        let conn = PlacesDb::open_in_memory(None)?;
+        let conn = PlacesDb::open_in_memory(ConnectionType::Sync)?;
         let record = HistoryRecord {
-            id: SyncGuid("aaaaaaaaaaaa".to_string()),
+            id: "aaaaaaaaaaaa".into(),
             title: "title".into(),
             hist_uri: "invalid".into(),
             sortindex: 0,
@@ -376,13 +373,13 @@ mod tests {
     #[test]
     fn test_new() -> Result<()> {
         let _ = env_logger::try_init();
-        let conn = PlacesDb::open_in_memory(None)?;
+        let conn = PlacesDb::open_in_memory(ConnectionType::Sync)?;
         let visits = vec![HistoryRecordVisit {
             date: SystemTime::now().into(),
             transition: 1,
         }];
         let record = HistoryRecord {
-            id: SyncGuid("aaaaaaaaaaaa".to_string()),
+            id: "aaaaaaaaaaaa".into(),
             title: "title".into(),
             hist_uri: "https://example.com".into(),
             sortindex: 0,
@@ -400,14 +397,14 @@ mod tests {
     #[test]
     fn test_plan_dupe_visit_same_guid() -> Result<()> {
         let _ = env_logger::try_init();
-        let mut conn = PlacesDb::open_in_memory(None).expect("no memory db");
+        let conn = PlacesDb::open_in_memory(ConnectionType::Sync).expect("no memory db");
         let now = SystemTime::now();
         let url = Url::parse("https://example.com").expect("is valid");
         // add it locally
         let obs = VisitObservation::new(url.clone())
             .with_visit_type(VisitTransition::Link)
             .with_at(Some(now.into()));
-        apply_observation(&mut conn, obs).expect("should apply");
+        apply_observation(&conn, obs).expect("should apply");
         // should be New with a change counter.
         assert_eq!(get_sync(&conn, &url), (SyncStatus::New, 1));
 
@@ -437,14 +434,14 @@ mod tests {
     #[test]
     fn test_plan_dupe_visit_different_guid_no_visits() {
         let _ = env_logger::try_init();
-        let mut conn = PlacesDb::open_in_memory(None).expect("no memory db");
+        let conn = PlacesDb::open_in_memory(ConnectionType::Sync).expect("no memory db");
         let now = SystemTime::now();
         let url = Url::parse("https://example.com").expect("is valid");
         // add it locally
         let obs = VisitObservation::new(url.clone())
             .with_visit_type(VisitTransition::Link)
             .with_at(Some(now.into()));
-        apply_observation(&mut conn, obs).expect("should apply");
+        apply_observation(&conn, obs).expect("should apply");
 
         assert_eq!(get_sync(&conn, &url), (SyncStatus::New, 1));
 
@@ -473,7 +470,7 @@ mod tests {
         // which reference the same URL.
         // This is testing the case when there are no local visits to that URL.
         let _ = env_logger::try_init();
-        let db = PlacesDb::open_in_memory(None)?;
+        let db = PlacesDb::open_in_memory(ConnectionType::Sync)?;
         let guid1 = SyncGuid::new();
         let ts1: Timestamp = (SystemTime::now() - Duration::new(5, 0)).into();
 
@@ -503,13 +500,18 @@ mod tests {
         }))?;
         incoming.changes.push((payload2, ServerTimestamp(0f64)));
 
-        let outgoing = apply_plan(&db, incoming, &mut telemetry::EngineIncoming::new())?;
+        let outgoing = apply_plan(
+            &db,
+            incoming,
+            &mut telemetry::EngineIncoming::new(),
+            &NeverInterrupts,
+        )?;
         assert_eq!(
             outgoing.changes.len(),
             1,
             "should have guid1 as outgoing with both visits."
         );
-        assert_eq!(outgoing.changes[0].id, guid1.0);
+        assert_eq!(outgoing.changes[0].id, guid1.as_ref());
 
         // should have 1 URL with both visits locally.
         let (page, visits) = fetch_visits(&db, &url, 3)?.expect("page exists");
@@ -527,7 +529,7 @@ mod tests {
         // but they are yet to be synced - the local guid should change and
         // all visits should be applied.
         let _ = env_logger::try_init();
-        let mut db = PlacesDb::open_in_memory(None)?;
+        let db = PlacesDb::open_in_memory(ConnectionType::Sync)?;
 
         let guid1 = SyncGuid::new();
         let ts1: Timestamp = (SystemTime::now() - Duration::new(5, 0)).into();
@@ -539,8 +541,8 @@ mod tests {
         let ts_local: Timestamp = (SystemTime::now() - Duration::new(10, 0)).into();
         let obs = VisitObservation::new(url.clone())
             .with_visit_type(VisitTransition::Link)
-            .with_at(Some(ts_local.into()));
-        apply_observation(&mut db, obs)?;
+            .with_at(Some(ts_local));
+        apply_observation(&db, obs)?;
 
         // 2 incoming records with the same URL.
         let mut incoming = IncomingChangeset::new("history".to_string(), ServerTimestamp(0f64));
@@ -564,9 +566,14 @@ mod tests {
         }))?;
         incoming.changes.push((payload2, ServerTimestamp(0f64)));
 
-        let outgoing = apply_plan(&db, incoming, &mut telemetry::EngineIncoming::new())?;
+        let outgoing = apply_plan(
+            &db,
+            incoming,
+            &mut telemetry::EngineIncoming::new(),
+            &NeverInterrupts,
+        )?;
         assert_eq!(outgoing.changes.len(), 1, "should have guid1 as outgoing");
-        assert_eq!(outgoing.changes[0].id, guid1.0);
+        assert_eq!(outgoing.changes[0].id, guid1.as_ref());
 
         // should have 1 URL with all visits locally, but with the first incoming guid.
         let (page, visits) = fetch_visits(&db, &url, 3)?.expect("page exists");
@@ -584,7 +591,7 @@ mod tests {
         // and they have been synced - the existing guid should not change,
         // although all visits should still be applied.
         let _ = env_logger::try_init();
-        let mut db = PlacesDb::open_in_memory(None)?;
+        let db = PlacesDb::open_in_memory(ConnectionType::Sync)?;
 
         let guid1 = SyncGuid::new();
         let ts1: Timestamp = (SystemTime::now() - Duration::new(5, 0)).into();
@@ -596,8 +603,8 @@ mod tests {
         let ts_local: Timestamp = (SystemTime::now() - Duration::new(10, 0)).into();
         let obs = VisitObservation::new(url.clone())
             .with_visit_type(VisitTransition::Link)
-            .with_at(Some(ts_local.into()));
-        apply_observation(&mut db, obs)?;
+            .with_at(Some(ts_local));
+        apply_observation(&db, obs)?;
 
         // 2 incoming records with the same URL.
         let mut incoming = IncomingChangeset::new("history".to_string(), ServerTimestamp(0f64));
@@ -621,7 +628,12 @@ mod tests {
         }))?;
         incoming.changes.push((payload2, ServerTimestamp(0f64)));
 
-        let outgoing = apply_plan(&db, incoming, &mut telemetry::EngineIncoming::new())?;
+        let outgoing = apply_plan(
+            &db,
+            incoming,
+            &mut telemetry::EngineIncoming::new(),
+            &NeverInterrupts,
+        )?;
         assert_eq!(
             outgoing.changes.len(),
             1,
@@ -645,14 +657,19 @@ mod tests {
             "histUri": "http://example.com",
             "sortindex": 0,
             "ttl": 100,
-            "visits": [ {"date": 15423493234840000000u64, "type": 1}]
+            "visits": [ {"date": 15_423_493_234_840_000_000u64, "type": 1}]
         });
         let mut result = IncomingChangeset::new("history".to_string(), ServerTimestamp(0f64));
         let payload = Payload::from_json(json).unwrap();
         result.changes.push((payload, ServerTimestamp(0f64)));
 
-        let db = PlacesDb::open_in_memory(None)?;
-        let outgoing = apply_plan(&db, result, &mut telemetry::EngineIncoming::new())?;
+        let db = PlacesDb::open_in_memory(ConnectionType::Sync)?;
+        let outgoing = apply_plan(
+            &db,
+            result,
+            &mut telemetry::EngineIncoming::new(),
+            &NeverInterrupts,
+        )?;
         assert_eq!(outgoing.changes.len(), 0, "nothing outgoing");
 
         let now: Timestamp = SystemTime::now().into();
@@ -681,21 +698,26 @@ mod tests {
         let payload = Payload::from_json(json).unwrap();
         result.changes.push((payload, ServerTimestamp(0f64)));
 
-        let db = PlacesDb::open_in_memory(None)?;
-        let outgoing = apply_plan(&db, result, &mut telemetry::EngineIncoming::new())?;
+        let db = PlacesDb::open_in_memory(ConnectionType::Sync)?;
+        let outgoing = apply_plan(
+            &db,
+            result,
+            &mut telemetry::EngineIncoming::new(),
+            &NeverInterrupts,
+        )?;
         assert_eq!(outgoing.changes.len(), 0, "should skip the invalid entry");
         Ok(())
     }
 
     #[test]
     fn test_apply_plan_incoming_invalid_visit_type() -> Result<()> {
-        let db = PlacesDb::open_in_memory(None)?;
+        let db = PlacesDb::open_in_memory(ConnectionType::Sync)?;
         let visits = vec![HistoryRecordVisit {
             date: SystemTime::now().into(),
             transition: 99,
         }];
         let record = HistoryRecord {
-            id: SyncGuid("aaaaaaaaaaaa".to_string()),
+            id: "aaaaaaaaaaaa".into(),
             title: "title".into(),
             hist_uri: "http://example.com".into(),
             sortindex: 0,
@@ -728,8 +750,13 @@ mod tests {
         let payload = Payload::from_json(json).unwrap();
         result.changes.push((payload, ServerTimestamp(0f64)));
 
-        let db = PlacesDb::open_in_memory(None)?;
-        let outgoing = apply_plan(&db, result, &mut telemetry::EngineIncoming::new())?;
+        let db = PlacesDb::open_in_memory(ConnectionType::Sync)?;
+        let outgoing = apply_plan(
+            &db,
+            result,
+            &mut telemetry::EngineIncoming::new(),
+            &NeverInterrupts,
+        )?;
 
         // should have applied it locally.
         let (page, visits) =
@@ -761,16 +788,21 @@ mod tests {
     #[test]
     fn test_apply_plan_outgoing_new() -> Result<()> {
         let _ = env_logger::try_init();
-        let mut db = PlacesDb::open_in_memory(None)?;
+        let db = PlacesDb::open_in_memory(ConnectionType::Sync)?;
         let url = Url::parse("https://example.com")?;
         let now = SystemTime::now();
         let obs = VisitObservation::new(url.clone())
             .with_visit_type(VisitTransition::Link)
             .with_at(Some(now.into()));
-        apply_observation(&mut db, obs)?;
+        apply_observation(&db, obs)?;
 
         let incoming = IncomingChangeset::new("history".to_string(), ServerTimestamp(0f64));
-        let outgoing = apply_plan(&db, incoming, &mut telemetry::EngineIncoming::new())?;
+        let outgoing = apply_plan(
+            &db,
+            incoming,
+            &mut telemetry::EngineIncoming::new(),
+            &NeverInterrupts,
+        )?;
 
         assert_eq!(outgoing.changes.len(), 1);
         Ok(())
@@ -779,7 +811,7 @@ mod tests {
     #[test]
     fn test_simple_visit_reconciliation() -> Result<()> {
         let _ = env_logger::try_init();
-        let mut db = PlacesDb::open_in_memory(None)?;
+        let db = PlacesDb::open_in_memory(ConnectionType::Sync)?;
         let ts: Timestamp = (SystemTime::now() - Duration::new(5, 0)).into();
         let url = Url::parse("https://example.com")?;
 
@@ -787,7 +819,7 @@ mod tests {
         let obs = VisitObservation::new(url.clone())
             .with_visit_type(VisitTransition::Link)
             .with_at(Some(ts));
-        apply_observation(&mut db, obs)?;
+        apply_observation(&db, obs)?;
         // Sync status should be "new" and have a change recorded.
         assert_eq!(get_sync(&db, &url), (SyncStatus::New, 1));
 
@@ -807,7 +839,12 @@ mod tests {
         let payload = Payload::from_json(json).unwrap();
         incoming.changes.push((payload, ServerTimestamp(0f64)));
 
-        apply_plan(&db, incoming, &mut telemetry::EngineIncoming::new())?;
+        apply_plan(
+            &db,
+            incoming,
+            &mut telemetry::EngineIncoming::new(),
+            &NeverInterrupts,
+        )?;
 
         // should still have only 1 visit and it should still be local.
         let (_page, visits) = fetch_visits(&db, &url, 2)?.expect("page exists");
@@ -821,7 +858,7 @@ mod tests {
     #[test]
     fn test_simple_visit_incoming_and_outgoing() -> Result<()> {
         let _ = env_logger::try_init();
-        let mut db = PlacesDb::open_in_memory(None)?;
+        let db = PlacesDb::open_in_memory(ConnectionType::Sync)?;
         let ts1: Timestamp = (SystemTime::now() - Duration::new(5, 0)).into();
         let ts2: Timestamp = SystemTime::now().into();
         let url = Url::parse("https://example.com")?;
@@ -830,7 +867,7 @@ mod tests {
         let obs = VisitObservation::new(url.clone())
             .with_visit_type(VisitTransition::Link)
             .with_at(Some(ts1));
-        apply_observation(&mut db, obs)?;
+        apply_observation(&db, obs)?;
 
         let guid = get_existing_guid(&db, &url);
 
@@ -848,7 +885,12 @@ mod tests {
         let payload = Payload::from_json(json).unwrap();
         incoming.changes.push((payload, ServerTimestamp(0f64)));
 
-        let outgoing = apply_plan(&db, incoming, &mut telemetry::EngineIncoming::new())?;
+        let outgoing = apply_plan(
+            &db,
+            incoming,
+            &mut telemetry::EngineIncoming::new(),
+            &NeverInterrupts,
+        )?;
 
         // should now have both visits locally.
         let (_page, visits) = fetch_visits(&db, &url, 3)?.expect("page exists");
@@ -876,12 +918,12 @@ mod tests {
     #[test]
     fn test_incoming_tombstone_local_new() -> Result<()> {
         let _ = env_logger::try_init();
-        let mut db = PlacesDb::open_in_memory(None)?;
+        let db = PlacesDb::open_in_memory(ConnectionType::Sync)?;
         let url = Url::parse("https://example.com")?;
         let obs = VisitObservation::new(url.clone())
             .with_visit_type(VisitTransition::Link)
             .with_at(Some(SystemTime::now().into()));
-        apply_observation(&mut db, obs)?;
+        apply_observation(&db, obs)?;
         assert_eq!(get_sync(&db, &url), (SyncStatus::New, 1));
 
         let guid = get_existing_guid(&db, &url);
@@ -896,7 +938,12 @@ mod tests {
         let payload = Payload::from_json(json).unwrap();
         incoming.changes.push((payload, ServerTimestamp(0f64)));
 
-        let outgoing = apply_plan(&db, incoming, &mut telemetry::EngineIncoming::new())?;
+        let outgoing = apply_plan(
+            &db,
+            incoming,
+            &mut telemetry::EngineIncoming::new(),
+            &NeverInterrupts,
+        )?;
         assert_eq!(outgoing.changes.len(), 0, "should be nothing outgoing");
         assert_eq!(get_tombstone_count(&db), 0, "should be no tombstones");
         Ok(())
@@ -905,12 +952,12 @@ mod tests {
     #[test]
     fn test_incoming_tombstone_local_normal() -> Result<()> {
         let _ = env_logger::try_init();
-        let mut db = PlacesDb::open_in_memory(None)?;
+        let db = PlacesDb::open_in_memory(ConnectionType::Sync)?;
         let url = Url::parse("https://example.com")?;
         let obs = VisitObservation::new(url.clone())
             .with_visit_type(VisitTransition::Link)
             .with_at(Some(SystemTime::now().into()));
-        apply_observation(&mut db, obs)?;
+        apply_observation(&db, obs)?;
         let guid = get_existing_guid(&db, &url);
 
         // Set the status to normal
@@ -918,6 +965,7 @@ mod tests {
             &db,
             IncomingChangeset::new("history".to_string(), ServerTimestamp(0f64)),
             &mut telemetry::EngineIncoming::new(),
+            &NeverInterrupts,
         )?;
         // It should have changed to normal but still have the initial counter.
         assert_eq!(get_sync(&db, &url), (SyncStatus::Normal, 1));
@@ -932,7 +980,12 @@ mod tests {
         let payload = Payload::from_json(json).unwrap();
         incoming.changes.push((payload, ServerTimestamp(0f64)));
 
-        let outgoing = apply_plan(&db, incoming, &mut telemetry::EngineIncoming::new())?;
+        let outgoing = apply_plan(
+            &db,
+            incoming,
+            &mut telemetry::EngineIncoming::new(),
+            &NeverInterrupts,
+        )?;
         assert_eq!(outgoing.changes.len(), 0, "should be nothing outgoing");
         Ok(())
     }
@@ -940,12 +993,12 @@ mod tests {
     #[test]
     fn test_outgoing_tombstone() -> Result<()> {
         let _ = env_logger::try_init();
-        let mut db = PlacesDb::open_in_memory(None)?;
+        let db = PlacesDb::open_in_memory(ConnectionType::Sync)?;
         let url = Url::parse("https://example.com")?;
         let obs = VisitObservation::new(url.clone())
             .with_visit_type(VisitTransition::Link)
             .with_at(Some(SystemTime::now().into()));
-        apply_observation(&mut db, obs)?;
+        apply_observation(&db, obs)?;
         let guid = get_existing_guid(&db, &url);
 
         // Set the status to normal
@@ -953,6 +1006,7 @@ mod tests {
             &db,
             IncomingChangeset::new("history".to_string(), ServerTimestamp(0f64)),
             &mut telemetry::EngineIncoming::new(),
+            &NeverInterrupts,
         )?;
         // It should have changed to normal but still have the initial counter.
         assert_eq!(get_sync(&db, &url), (SyncStatus::Normal, 1));
@@ -967,6 +1021,7 @@ mod tests {
             &db,
             IncomingChangeset::new("history".to_string(), ServerTimestamp(0f64)),
             &mut telemetry::EngineIncoming::new(),
+            &NeverInterrupts,
         )?;
         assert_eq!(outgoing.changes.len(), 1, "tombstone should be uploaded");
         finish_plan(&db)?;

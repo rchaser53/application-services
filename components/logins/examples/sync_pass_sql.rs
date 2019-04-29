@@ -3,6 +3,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 #![recursion_limit = "4096"]
+#![allow(unknown_lints)]
+#![warn(rust_2018_idioms)]
 
 use cli_support::fxa_creds::{get_cli_fxa, get_default_fxa_config};
 use cli_support::prompt::{prompt_string, prompt_usize};
@@ -12,7 +14,7 @@ use logins::{Login, PasswordEngine};
 use prettytable::*;
 use rusqlite::NO_PARAMS;
 use serde_json;
-use sync15::telemetry;
+use sync15::{telemetry, StoreSyncAssociation};
 
 // I'm completely punting on good error handling here.
 type Result<T> = std::result::Result<T, failure::Error>;
@@ -26,7 +28,7 @@ fn read_login() -> Login {
     let username_field = prompt_string("username_field").unwrap_or_default();
     let password_field = prompt_string("password_field").unwrap_or_default();
     let record = Login {
-        id: sync15::random_guid().unwrap().into(),
+        id: sync15::random_guid().unwrap(),
         username,
         password,
         username_field,
@@ -54,7 +56,7 @@ fn update_string(field_name: &str, field: &mut String, extra: &str) -> bool {
 }
 
 fn string_opt(o: &Option<String>) -> Option<&str> {
-    o.as_ref().map(|s| s.as_ref())
+    o.as_ref().map(AsRef::as_ref)
 }
 
 fn string_opt_or<'a>(o: &'a Option<String>, or: &'a str) -> &'a str {
@@ -122,14 +124,14 @@ fn timestamp_to_string(milliseconds: i64) -> String {
 }
 
 fn show_sql(e: &PasswordEngine, sql: &str) -> Result<()> {
-    use prettytable::{cell::Cell, row::Row, Table};
+    use prettytable::{cell::Cell, row::Row};
     use rusqlite::types::Value;
     let conn = e.conn();
     let mut stmt = conn.prepare(sql)?;
     let cols: Vec<String> = stmt
         .column_names()
         .into_iter()
-        .map(|x| x.to_owned())
+        .map(ToOwned::to_owned)
         .collect();
     let len = cols.len();
     let mut table = Table::new();
@@ -141,15 +143,16 @@ fn show_sql(e: &PasswordEngine, sql: &str) -> Result<()> {
 
     let rows = stmt.query_map(NO_PARAMS, |row| {
         (0..len)
-            .into_iter()
-            .map(|idx| match row.get::<_, Value>(idx) {
-                Value::Null => Cell::new("null").style_spec("Fd"),
-                Value::Integer(i) => Cell::new(&i.to_string()).style_spec("Fb"),
-                Value::Real(r) => Cell::new(&r.to_string()).style_spec("Fb"),
-                Value::Text(s) => Cell::new(&s.to_string()).style_spec("Fr"),
-                Value::Blob(b) => Cell::new(&format!("{}b blob", b.len())),
+            .map(|idx| {
+                Ok(match row.get::<_, Value>(idx)? {
+                    Value::Null => Cell::new("null").style_spec("Fd"),
+                    Value::Integer(i) => Cell::new(&i.to_string()).style_spec("Fb"),
+                    Value::Real(r) => Cell::new(&r.to_string()).style_spec("Fb"),
+                    Value::Text(s) => Cell::new(&s.to_string()).style_spec("Fr"),
+                    Value::Blob(b) => Cell::new(&format!("{}b blob", b.len())),
+                })
             })
-            .collect::<Vec<_>>()
+            .collect::<std::result::Result<Vec<_>, _>>()
     })?;
 
     for row in rows {
@@ -235,6 +238,7 @@ fn init_logging() {
     env_logger::init_from_env(env_logger::Env::default().filter_or("RUST_LOG", spec));
 }
 
+#[allow(clippy::cyclomatic_complexity)] // FIXME
 fn main() -> Result<()> {
     init_logging();
     std::env::set_var("RUST_BACKTRACE", "1");
@@ -348,13 +352,13 @@ fn main() -> Result<()> {
             }
             'R' | 'r' => {
                 log::info!("Resetting client.");
-                if let Err(e) = engine.db.reset() {
+                if let Err(e) = engine.db.reset(&StoreSyncAssociation::Disconnected) {
                     log::warn!("Failed to reset! {}", e);
                 }
             }
             'W' | 'w' => {
                 log::info!("Wiping all data from client!");
-                if let Err(e) = engine.db.wipe() {
+                if let Err(e) = engine.wipe() {
                     log::warn!("Failed to wipe! {}", e);
                 }
             }

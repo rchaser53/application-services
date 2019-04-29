@@ -1,3 +1,4 @@
+@file:Suppress("MaxLineLength")
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -10,9 +11,8 @@ import com.sun.jna.Native
 import com.sun.jna.Pointer
 import java.lang.reflect.Proxy
 import mozilla.appservices.support.RustBuffer
-import mozilla.appservices.fxaclient.FxaException
 
-@Suppress("FunctionNaming", "TooManyFunctions", "TooGenericExceptionThrown")
+@Suppress("FunctionNaming", "FunctionParameterNaming", "LongParameterList", "TooGenericExceptionThrown")
 internal interface LibFxAFFI : Library {
     companion object {
         private val JNA_LIBRARY_NAME = {
@@ -25,25 +25,19 @@ internal interface LibFxAFFI : Library {
             }
         }()
 
-        internal var INSTANCE: LibFxAFFI
-
-        init {
-            try {
-                INSTANCE = Native.loadLibrary(JNA_LIBRARY_NAME, LibFxAFFI::class.java) as LibFxAFFI
-                if (JNA_LIBRARY_NAME == "fxaclient_ffi") {
-                    // Enable logcat logging if we aren't in a megazord.
-                    INSTANCE.fxa_enable_logcat_logging()
-                }
-            } catch (e: UnsatisfiedLinkError) {
-                // We want to be able load this class in environments that don't have FxA native
-                // libs available (for unit testing purposes). This also has the advantage of
-                // not stopping the whole world in case of missing native FxA libs.
-                INSTANCE = Proxy.newProxyInstance(
-                        LibFxAFFI::class.java.classLoader,
-                        arrayOf(LibFxAFFI::class.java)) { _, _, _ ->
-                    throw FxaException("Firefox Account functionality not available")
-                } as LibFxAFFI
+        internal var INSTANCE: LibFxAFFI = try {
+            val lib = Native.load<LibFxAFFI>(JNA_LIBRARY_NAME, LibFxAFFI::class.java)
+            if (JNA_LIBRARY_NAME == "fxaclient_ffi") {
+                // Enable logcat logging if we aren't in a megazord.
+                lib.fxa_enable_logcat_logging()
             }
+            lib
+        } catch (e: UnsatisfiedLinkError) {
+            Proxy.newProxyInstance(
+                    LibFxAFFI::class.java.classLoader,
+                    arrayOf(LibFxAFFI::class.java)) { _, _, _ ->
+                throw RuntimeException("Firefox Account functionality not available", e)
+            } as LibFxAFFI
         }
     }
 
@@ -77,13 +71,38 @@ internal interface LibFxAFFI : Library {
 
     fun fxa_get_token_server_endpoint_url(fxa: FxaHandle, e: RustError.ByReference): Pointer?
     fun fxa_get_connection_success_url(fxa: FxaHandle, e: RustError.ByReference): Pointer?
+    fun fxa_get_manage_account_url(fxa: FxaHandle, entrypoint: String, e: RustError.ByReference): Pointer?
+    fun fxa_get_manage_devices_url(fxa: FxaHandle, entrypoint: String, e: RustError.ByReference): Pointer?
 
     fun fxa_complete_oauth_flow(fxa: FxaHandle, code: String, state: String, e: RustError.ByReference)
     fun fxa_get_access_token(fxa: FxaHandle, scope: String, e: RustError.ByReference): RustBuffer.ByValue
+
+    fun fxa_set_push_subscription(
+        fxa: FxaHandle,
+        endpoint: String,
+        publicKey: String,
+        authKey: String,
+        e: RustError.ByReference
+    )
+    fun fxa_set_device_name(fxa: FxaHandle, displayName: String, e: RustError.ByReference)
+    fun fxa_get_devices(fxa: FxaHandle, e: RustError.ByReference): RustBuffer.ByValue
+    fun fxa_destroy_device(fxa: FxaHandle, targetDeviceId: String, e: RustError.ByReference)
+    fun fxa_poll_device_commands(fxa: FxaHandle, e: RustError.ByReference): RustBuffer.ByValue
+    fun fxa_handle_push_message(fxa: FxaHandle, jsonPayload: String, e: RustError.ByReference): RustBuffer.ByValue
+
+    fun fxa_initialize_device(
+        fxa: FxaHandle,
+        name: String,
+        type: Int,
+        capabilities_data: Pointer,
+        capabilities_len: Int,
+        e: RustError.ByReference
+    )
+    fun fxa_ensure_capabilities(fxa: FxaHandle, e: RustError.ByReference)
+    fun fxa_send_tab(fxa: FxaHandle, targetDeviceId: String, title: String, url: String, e: RustError.ByReference)
 
     fun fxa_str_free(string: Pointer)
     fun fxa_bytebuffer_free(buffer: RustBuffer.ByValue)
     fun fxa_free(fxa: FxaHandle, err: RustError.ByReference)
 }
 internal typealias FxaHandle = Long
-

@@ -9,7 +9,7 @@ use crate::{
     Config, FirefoxAccount, StateV2,
 };
 use serde_derive::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 impl FirefoxAccount {
     // Initialize state from Firefox Accounts credentials obtained using the
@@ -42,21 +42,25 @@ impl FirefoxAccount {
             login_state,
             refresh_token: None,
             scoped_keys: HashMap::new(),
+            last_handled_command: None,
+            commands_data: HashMap::new(),
+            device_capabilities: HashSet::new(),
         }))
     }
 
-    fn to_married(&mut self) -> Option<&MarriedState> {
-        self.advance();
+    fn advance_to_married(&mut self) -> Result<Option<&MarriedState>> {
+        self.advance()?;
         match self.state.login_state {
-            LoginState::Married(ref married) => Some(married),
-            _ => None,
+            LoginState::Married(ref married) => Ok(Some(married)),
+            _ => Ok(None),
         }
     }
 
-    pub fn advance(&mut self) {
+    pub fn advance(&mut self) -> Result<()> {
         let state_machine = LoginStateMachine::new(&self.state.config, self.client.clone());
         let state = std::mem::replace(&mut self.state.login_state, LoginState::Unknown);
-        self.state.login_state = state_machine.advance(state);
+        self.state.login_state = state_machine.advance(state)?;
+        Ok(())
     }
 
     pub(crate) fn session_token_from_state(state: &LoginState) -> Option<&[u8]> {
@@ -73,7 +77,7 @@ impl FirefoxAccount {
     }
 
     pub fn generate_assertion(&mut self, audience: &str) -> Result<String> {
-        let married = match self.to_married() {
+        let married = match self.advance_to_married()? {
             Some(married) => married,
             None => return Err(ErrorKind::NotMarried.into()),
         };
@@ -87,7 +91,7 @@ impl FirefoxAccount {
     }
 
     pub fn get_sync_keys(&mut self) -> Result<SyncKeys> {
-        let married = match self.to_married() {
+        let married = match self.advance_to_married()? {
             Some(married) => married,
             None => return Err(ErrorKind::NotMarried.into()),
         };
@@ -97,7 +101,7 @@ impl FirefoxAccount {
 
     pub fn sign_out(mut self) {
         self.client.sign_out();
-        self.state.login_state = self.state.login_state.to_separated();
+        self.state.login_state = self.state.login_state.into_separated();
     }
 }
 
@@ -116,7 +120,7 @@ pub struct WebChannelResponse {
 
 impl WebChannelResponse {
     pub fn from_json(json: &str) -> Result<WebChannelResponse> {
-        serde_json::from_str(json).map_err(|e| e.into())
+        serde_json::from_str(json).map_err(Into::into)
     }
 }
 

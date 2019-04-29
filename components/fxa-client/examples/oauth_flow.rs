@@ -1,24 +1,24 @@
+use cli_support::prompt::prompt_string;
 use fxa_client::FirefoxAccount;
 use std::collections::HashMap;
-use text_io::*;
 use url::Url;
 
-static CONTENT_SERVER: &'static str = "http://127.0.0.1:3030";
-static CLIENT_ID: &'static str = "7f368c6886429f19";
-static REDIRECT_URI: &'static str = "https://mozilla.github.io/notes/fxa/android-redirect.html";
-static SCOPES: &'static [&'static str] = &["https://identity.mozilla.com/apps/oldsync"];
+const CONTENT_SERVER: &str = "http://127.0.0.1:3030";
+const CLIENT_ID: &str = "7f368c6886429f19";
+const REDIRECT_URI: &str = "https://mozilla.github.io/notes/fxa/android-redirect.html";
+const SCOPES: &[&str] = &["https://identity.mozilla.com/apps/oldsync"];
 
 fn main() {
     let mut fxa = FirefoxAccount::new(CONTENT_SERVER, CLIENT_ID, REDIRECT_URI);
     let url = fxa.begin_oauth_flow(&SCOPES, false).unwrap();
     println!("Open the following URL:");
     println!("{}", url);
-    println!("Obtained redirect URI:");
-    let redirect_uri: String = read!("{}\n");
+    let redirect_uri: String = prompt_string("Obtained redirect URI").unwrap();
     let redirect_uri = Url::parse(&redirect_uri).unwrap();
     let query_params: HashMap<_, _> = redirect_uri.query_pairs().into_owned().collect();
-    let code = query_params.get("code").unwrap();
-    let state = query_params.get("state").unwrap();
-    let oauth_info = fxa.complete_oauth_flow(&code, &state).unwrap();
+    let code = &query_params["code"];
+    let state = &query_params["state"];
+    fxa.complete_oauth_flow(&code, &state).unwrap();
+    let oauth_info = fxa.get_access_token(SCOPES[0]);
     println!("access_token: {:?}", oauth_info);
 }

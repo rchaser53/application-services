@@ -1,10 +1,12 @@
 apply plugin: 'com.android.library'
 apply plugin: 'org.mozilla.rust-android-gradle.rust-android'
+apply plugin: 'kotlin-android'
+apply plugin: 'kotlin-android-extensions'
 
 import com.sun.jna.Platform
 
 android {
-    compileSdkVersion 27
+    compileSdkVersion rootProject.ext.build.compileSdkVersion
 
     defaultConfig {
         minSdkVersion rootProject.ext.build['minSdkVersion']
@@ -22,15 +24,13 @@ android {
     }
 
     sourceSets {
+        main.jniLibs.srcDirs += "$buildDir/nativeLibs/android"
         test.resources.srcDirs += "$buildDir/rustJniLibs/desktop"
+        test.resources.srcDirs += "$buildDir/nativeLibs/desktop"
     }
 
-    // Help folks debugging by including symbols in our native libraries.  Yes, this makes the
-    // resulting AAR very large.  The Android ecosystem seems to be in flux around who is in charge
-    // of stripping native binaries, but for now let's provide symbols and see how consumers react.
-    packagingOptions {
-        doNotStrip "**/*.so"
-    }
+    // Uncomment to include debug symbols in native library builds.
+    // packagingOptions { doNotStrip "**/*.so" }
 }
 
 configurations {
@@ -64,28 +64,28 @@ cargo {
 
     // The Cargo targets to invoke.  The mapping from short name to target
     // triple is defined by the `rust-android-gradle` plugin.
-    targets = [
-        'linux-x86-64',
-        'darwin',
-        'win32-x86-64-gnu',
-        'arm',
-        'arm64',
-        'x86',
-    ]
+    targets = rootProject.ext.rustTargets
 
     // Perform release builds (which should have debug info, due to
     // `debug = true` in Cargo.toml).
     profile = "release"
 
-    exec = rootProject.ext.cargoExec
+    exec = rootProject.ext.cargoExecWithSQLCipher
+
+    extraCargoBuildArguments = rootProject.ext.extraCargoBuildArguments
 }
 
 dependencies {
     api project(path: ':fxa-client-library', configuration: 'withoutLib')
     api project(path: ':logins-library', configuration: 'withoutLib')
     api project(path: ':rustlog-library', configuration: 'withoutLib')
+    api project(path: ':viaduct-library', configuration: 'withoutLib')
+    compile project(path: ':viaduct-library')
 
-    jnaForTest 'net.java.dev.jna:jna:4.5.2@jar'
+    implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk7:$kotlin_version"
+    api "org.mozilla.components:concept-fetch:$android_components_version"
+
+    jnaForTest "net.java.dev.jna:jna:$jna_version@jar"
 }
 
 afterEvaluate {
@@ -97,17 +97,19 @@ afterEvaluate {
         }
         def buildType = "${variant.buildType.name.capitalize()}"
         tasks["generate${productFlavor}${buildType}Assets"].dependsOn(tasks["cargoBuild"])
+        tasks["generate${productFlavor}${buildType}Assets"].dependsOn(tasks["copyNativeLibs"])
 
         // For unit tests.
         tasks["process${productFlavor}${buildType}UnitTestJavaRes"].dependsOn(tasks["cargoBuild"])
+        tasks["process${productFlavor}${buildType}UnitTestJavaRes"].dependsOn(tasks["copyNativeLibs"])
     }
 }
 
 apply from: "$rootDir/publish.gradle"
+// If using jnaForTestConfiguration or variantWithoutLib,
+// please also update the corresponding .buildconfig-android.yml
+// `publishedArtifacts` property.
 ext.configurePublish(
-        'org.mozilla.appservices',
-        'lockbox-megazord',
-        'Megazord of [fxaclient, logins, logging]',
         /* jnaForTestConfiguration= */ configurations.jnaForTest,
         /* variantWithoutLib= */ null,
 )

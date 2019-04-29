@@ -2,9 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+#![allow(unknown_lints)]
+#![warn(rust_2018_idioms)]
+
 use clap::value_t;
 use failure::bail;
-use places::{VisitObservation, VisitTransition};
+use places::{PlacesDb, VisitObservation, VisitTransition};
 use rusqlite::NO_PARAMS;
 use serde_derive::*;
 use sql_support::ConnExt;
@@ -58,13 +61,13 @@ impl From<VisitObservation> for SerializedObservation {
     fn from(visit: VisitObservation) -> Self {
         Self {
             url: visit.url.to_string(),
-            title: visit.title.clone(),
+            title: visit.title,
             visit_type: visit.visit_type.map(|vt| vt as u8),
-            at: visit.at.map(|at| at.into()),
+            at: visit.at.map(Into::into),
             error: visit.is_error.unwrap_or(false),
             is_redirect_source: visit.is_redirect_source.unwrap_or(false),
             remote: visit.is_remote.unwrap_or(false),
-            referrer: visit.referrer.map(|url| url.to_string()),
+            referrer: visit.referrer,
         }
     }
 }
@@ -98,27 +101,27 @@ struct LegacyPlace {
 }
 
 impl LegacyPlace {
-    pub fn from_row(row: &rusqlite::Row) -> Self {
+    pub fn from_row(row: &rusqlite::Row<'_>) -> Self {
         Self {
-            id: row.get("place_id"),
-            guid: row.get("place_guid"),
-            title: row.get("place_title"),
-            url: row.get("place_url"),
-            description: row.get("place_description"),
-            preview_image_url: row.get("place_preview_image_url"),
-            typed: row.get("place_typed"),
-            hidden: row.get("place_hidden"),
-            visit_count: row.get("place_visit_count"),
-            last_visit_date: row.get("place_last_visit_date"),
+            id: row.get_unwrap("place_id"),
+            guid: row.get_unwrap("place_guid"),
+            title: row.get_unwrap("place_title"),
+            url: row.get_unwrap("place_url"),
+            description: row.get_unwrap("place_description"),
+            preview_image_url: row.get_unwrap("place_preview_image_url"),
+            typed: row.get_unwrap("place_typed"),
+            hidden: row.get_unwrap("place_hidden"),
+            visit_count: row.get_unwrap("place_visit_count"),
+            last_visit_date: row.get_unwrap("place_last_visit_date"),
             visits: vec![LegacyPlaceVisit {
-                id: row.get("visit_id"),
-                date: row.get("visit_date"),
-                visit_type: row.get("visit_type"),
-                from_visit: row.get("visit_from_visit"),
+                id: row.get_unwrap("visit_id"),
+                date: row.get_unwrap("visit_date"),
+                visit_type: row.get_unwrap("visit_type"),
+                from_visit: row.get_unwrap("visit_from_visit"),
             }],
         }
     }
-    pub fn insert(self, conn: &rusqlite::Connection, options: &ImportPlacesOptions) -> Result<()> {
+    pub fn insert(self, db: &PlacesDb, options: &ImportPlacesOptions) -> Result<()> {
         let url = Url::parse(&self.url)?;
         for v in self.visits {
             let obs = VisitObservation::new(url.clone())
@@ -128,7 +131,7 @@ impl LegacyPlace {
                 .with_at(places::Timestamp((v.date / 1000) as u64))
                 .with_title(self.title.clone())
                 .with_is_remote(rand::random::<f64>() < options.remote_probability);
-            places::storage::history::apply_observation_direct(conn, obs)?;
+            places::storage::history::apply_observation_direct(db, obs)?;
         }
         Ok(())
     }
@@ -147,13 +150,13 @@ fn import_places(
     let (place_count, visit_count) = {
         let mut stmt = old.prepare("SELECT count(*) FROM moz_places").unwrap();
         let mut rows = stmt.query(NO_PARAMS).unwrap();
-        let ps: i64 = rows.next().unwrap()?.get(0);
+        let ps: i64 = rows.next()?.unwrap().get_unwrap(0);
 
         let mut stmt = old
             .prepare("SELECT count(*) FROM moz_historyvisits")
             .unwrap();
         let mut rows = stmt.query(NO_PARAMS).unwrap();
-        let vs: i64 = rows.next().unwrap()?.get(0);
+        let vs: i64 = rows.next()?.unwrap().get_unwrap(0);
         (ps, vs)
     };
 
@@ -196,22 +199,21 @@ fn import_places(
     };
     let mut place_counter = 0;
 
-    let tx = new.db.transaction()?;
+    let tx = new.unchecked_transaction()?;
 
     print!(
         "Processing {} / {} places (approx.)",
         place_counter, place_count
     );
     let _ = std::io::stdout().flush();
-    while let Some(row_or_error) = rows.next() {
-        let row = row_or_error?;
-        let id: i64 = row.get("place_id");
+    while let Some(row) = rows.next()? {
+        let id: i64 = row.get("place_id")?;
         if current_place.id == id {
             current_place.visits.push(LegacyPlaceVisit {
-                id: row.get("visit_id"),
-                date: row.get("visit_date"),
-                visit_type: row.get("visit_type"),
-                from_visit: row.get("visit_from_visit"),
+                id: row.get("visit_id")?,
+                date: row.get("visit_date")?,
+                visit_type: row.get("visit_type")?,
+                from_visit: row.get("visit_from_visit")?,
             });
             continue;
         }
@@ -222,12 +224,12 @@ fn import_places(
         );
         let _ = std::io::stdout().flush();
         if current_place.id != -1 {
-            current_place.insert(tx.conn(), &options)?;
+            current_place.insert(new, &options)?;
         }
         current_place = LegacyPlace::from_row(&row);
     }
     if current_place.id != -1 {
-        current_place.insert(tx.conn(), &options)?;
+        current_place.insert(new, &options)?;
     }
     println!("Finished processing records");
     println!("Committing....");
@@ -248,8 +250,9 @@ where
 mod autocomplete {
     use super::*;
     use places::api::matcher::{search_frecent, SearchParams, SearchResult};
-    use places::{ErrorKind, PlacesInterruptHandle};
+    use places::ErrorKind;
     use rusqlite::{Error as RusqlError, ErrorCode};
+    use sql_support::SqlInterruptHandle;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         mpsc, Arc,
@@ -260,17 +263,12 @@ mod autocomplete {
     #[derive(Debug, Clone)]
     struct ConnectionArgs {
         path: PathBuf,
-        encryption_key: Option<String>,
     }
 
     impl ConnectionArgs {
         pub fn connect(&self) -> Result<places::PlacesDb> {
-            let key = match &self.encryption_key {
-                Some(k) => Some(k.as_str()),
-                _ => None,
-            };
-            // TODO: it would be nice if this could be a read-only connection.
-            Ok(places::PlacesDb::open(&self.path, key)?)
+            let api = places::PlacesApi::new(&self.path)?;
+            Ok(api.open_connection(places::ConnectionType::ReadOnly)?)
         }
     }
 
@@ -305,7 +303,7 @@ mod autocomplete {
         // Thread handle for the BG thread. We can't drop this without problems so we
         // prefix with _ to shut rust up about it being unused.
         _handle: thread::JoinHandle<Result<()>>,
-        interrupt_handle: PlacesInterruptHandle,
+        interrupt_handle: SqlInterruptHandle,
     }
 
     impl BackgroundAutocomplete {
@@ -346,7 +344,7 @@ mod autocomplete {
                             }
                             Err(e) => {
                                 match e.kind() {
-                                    ErrorKind::InterruptedError => {
+                                    ErrorKind::InterruptedError(_) => {
                                         // Ignore.
                                     }
                                     ErrorKind::SqlError(RusqlError::SqliteFailure(err, _))
@@ -423,10 +421,9 @@ mod autocomplete {
 
         // Combine ranges that overlap.
         let mut coalesced = vec![ranges[0]];
-        for i in 1..ranges.len() {
+        for curr in ranges.iter().skip(1) {
             // we know `coalesced` is never empty
             let prev = *coalesced.last().unwrap();
-            let curr = ranges[i];
             if curr.0 < prev.1 {
                 // Found an overlap. Update prev, but don't add cur.
                 if curr.1 > prev.0 {
@@ -435,7 +432,7 @@ mod autocomplete {
             // else `prev` already encompasses `curr` entirely... (IIRC
             // this is possible in weird cases).
             } else {
-                coalesced.push(curr);
+                coalesced.push(*curr);
             }
         }
 
@@ -494,7 +491,7 @@ mod autocomplete {
         Ok(())
     }
 
-    pub fn start_autocomplete(db_path: PathBuf, encryption_key: Option<&str>) -> Result<()> {
+    pub fn start_autocomplete(db_path: PathBuf) -> Result<()> {
         use termion::{
             clear, color,
             cursor::{self, Goto},
@@ -504,10 +501,7 @@ mod autocomplete {
             style::{Invert, NoInvert},
         };
 
-        let mut autocompleter = BackgroundAutocomplete::start(ConnectionArgs {
-            path: db_path,
-            encryption_key: encryption_key.map(|s| s.to_owned()),
-        })?;
+        let mut autocompleter = BackgroundAutocomplete::start(ConnectionArgs { path: db_path })?;
 
         let mut stdin = termion::async_stdin();
         let stdout = std::io::stdout().into_raw_mode()?;
@@ -568,14 +562,14 @@ mod autocomplete {
                     Key::Ctrl('n') | Key::Down => {
                         if let Some(res) = &results {
                             if pos + 1 < res.results.len() {
-                                pos = pos + 1;
+                                pos += 1;
                                 repaint_results = true;
                             }
                         }
                     }
                     Key::Ctrl('p') | Key::Up => {
                         if results.is_some() && pos > 0 {
-                            pos = pos - 1;
+                            pos -= 1;
                             repaint_results = true;
                         }
                     }
@@ -686,7 +680,7 @@ mod autocomplete {
                             results.search.limit,
                             results.search.search_string,
                             results.took.as_secs() * 1_000_000
-                                + (results.took.subsec_nanos() as u64 / 1000)
+                                + (u64::from(results.took.subsec_nanos()) / 1000)
                         )?;
                         let (_, term_h) = termion::terminal_size()?;
                         write!(stdout, "{}", Goto(1, 4))?;
@@ -779,11 +773,6 @@ fn main() -> Result<()> {
             .short("d")
             .takes_value(true)
             .help("Path to the database (with the *new* schema). Defaults to './new-places.db'"))
-        .arg(clap::Arg::with_name("encryption_key")
-            .long("encryption-key")
-            .short("k")
-            .takes_value(true)
-            .help("Encryption key to use with the database. Leave blank for unencrypted"))
         .arg(clap::Arg::with_name("import_places")
             .long("import-places")
             .short("p")
@@ -812,9 +801,9 @@ fn main() -> Result<()> {
     let db_path = matches
         .value_of("database_path")
         .unwrap_or("./new-places.db");
-    let encryption_key = matches.value_of("encryption_key");
 
-    let mut conn = places::PlacesDb::open(&db_path, encryption_key)?;
+    let api = places::PlacesApi::new(&db_path)?;
+    let mut conn = api.open_connection(places::ConnectionType::ReadWrite)?;
 
     if let Some(import_places_arg) = matches.value_of("import_places") {
         let options = ImportPlacesOptions {
@@ -866,11 +855,9 @@ fn main() -> Result<()> {
         let observations: Vec<SerializedObservation> = read_json_file(observations_json)?;
         let num_observations = observations.len();
         log::info!("Found {} observations", num_observations);
-        let mut counter = 0;
-        for obs in observations {
+        for (counter, obs) in observations.into_iter().enumerate() {
             let visit = obs.into_visit()?;
             places::apply_observation(&mut conn, visit)?;
-            counter += 1;
             if (counter % 1000) == 0 {
                 log::trace!("Importing observations {} / {}", counter, num_observations);
             }
@@ -882,7 +869,7 @@ fn main() -> Result<()> {
         #[cfg(not(windows))]
         {
             // Can't use cfg! macro, this module doesn't exist at all on windows
-            autocomplete::start_autocomplete(Path::new(db_path).to_owned(), encryption_key)?;
+            autocomplete::start_autocomplete(Path::new(db_path).to_owned())?;
         }
         #[cfg(windows)]
         {

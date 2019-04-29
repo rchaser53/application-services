@@ -3,13 +3,14 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use crate::error::{ErrorKind, Result};
-use openssl::hash::MessageDigest;
-use openssl::pkey::PKey;
-use openssl::sign::Signer;
-use openssl::{self, symm};
-use serde_derive::*;
+use openssl::symm;
+use rc_crypto::{
+    digest,
+    hmac::{self, Signature, SigningKey, VerificationKey},
+    rand,
+};
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct KeyBundle {
     enc_key: Vec<u8>,
     mac_key: Vec<u8>,
@@ -35,7 +36,7 @@ impl KeyBundle {
 
     pub fn new_random() -> Result<KeyBundle> {
         let mut buffer = [0u8; 64];
-        openssl::rand::rand_bytes(&mut buffer)?;
+        rand::fill(&mut buffer)?;
         KeyBundle::from_ksync_bytes(&buffer)
     }
 
@@ -58,7 +59,7 @@ impl KeyBundle {
     pub fn from_base64(enc: &str, mac: &str) -> Result<KeyBundle> {
         let enc_bytes = base64::decode(&enc)?;
         let mac_bytes = base64::decode(&mac)?;
-        KeyBundle::new(enc_bytes.into(), mac_bytes.into())
+        KeyBundle::new(enc_bytes, mac_bytes)
     }
 
     #[inline]
@@ -76,20 +77,9 @@ impl KeyBundle {
         [base64::encode(&self.enc_key), base64::encode(&self.mac_key)]
     }
 
-    /// Returns the 32 byte digest by value since it's small enough to be passed
-    /// around cheaply, and easily convertable into a slice or vec if you want.
-    fn hmac(&self, ciphertext: &[u8]) -> Result<[u8; 32]> {
-        let mut out = [0u8; 32];
-        let key = PKey::hmac(self.hmac_key())?;
-        let mut signer = Signer::new(MessageDigest::sha256(), &key)?;
-        signer.update(ciphertext)?;
-        let size = signer.sign(&mut out)?;
-        // This isn't an Err since it really should not be possible.
-        assert!(
-            size == 32,
-            "Somehow the 256 bits from sha256 do not add up into 32 bytes..."
-        );
-        Ok(out)
+    fn hmac(&self, ciphertext: &[u8]) -> Result<Signature> {
+        let key = SigningKey::new(&digest::SHA256, self.hmac_key());
+        Ok(hmac::sign(&key, ciphertext)?)
     }
 
     /// Important! Don't compare against this directly! use `verify_hmac` or `verify_hmac_string`!
@@ -97,32 +87,25 @@ impl KeyBundle {
         Ok(base16::encode_lower(&self.hmac(ciphertext)?))
     }
 
-    pub fn verify_hmac(&self, expected_hmac: &[u8], ciphertext_base64: &str) -> Result<bool> {
-        let computed_hmac = self.hmac(ciphertext_base64.as_bytes())?;
-        // I suspect this is unnecessary for our case, but the rust-openssl docs
-        // want us to use this over == to avoid sidechannels, and who am I to argue?
-        Ok(openssl::memcmp::eq(&expected_hmac, &computed_hmac))
+    pub fn verify_hmac(&self, expected_hmac: &[u8], ciphertext_base64: &str) -> Result<()> {
+        let key = VerificationKey::new(&digest::SHA256, self.hmac_key());
+        Ok(hmac::verify(
+            &key,
+            ciphertext_base64.as_bytes(),
+            expected_hmac,
+        )?)
     }
 
-    pub fn verify_hmac_string(&self, expected_hmac: &str, ciphertext_base64: &str) -> Result<bool> {
-        let computed_hmac = self.hmac(ciphertext_base64.as_bytes())?;
-        // Note: openssl::memcmp::eq panics if the sizes aren't the same. Desktop returns that it
-        // was a verification failure, so we will too.
-        if expected_hmac.len() != 64 {
-            log::warn!("Garbage HMAC verification string: Wrong length");
-            return Ok(false);
-        }
+    pub fn verify_hmac_string(&self, expected_hmac: &str, ciphertext_base64: &str) -> Result<()> {
         // Decode the expected_hmac into bytes to avoid issues if a client happens to encode
         // this as uppercase. This shouldn't happen in practice, but doing it this way is more
         // robust and avoids an allocation.
         let mut decoded_hmac = [0u8; 32];
-
-        if let Err(_) = base16::decode_slice(expected_hmac, &mut decoded_hmac) {
+        if base16::decode_slice(expected_hmac, &mut decoded_hmac).is_err() {
             log::warn!("Garbage HMAC verification string: contained non base16 characters");
-            return Ok(false);
+            return Err(ErrorKind::HmacMismatch.into());
         }
-
-        Ok(openssl::memcmp::eq(&decoded_hmac, &computed_hmac))
+        self.verify_hmac(&decoded_hmac, ciphertext_base64)
     }
 
     /// Decrypt the provided ciphertext with the given iv, and decodes the
@@ -153,7 +136,7 @@ impl KeyBundle {
     /// and the generated iv.
     pub fn encrypt_bytes_rand_iv(&self, cleartext_bytes: &[u8]) -> Result<(Vec<u8>, [u8; 16])> {
         let mut iv = [0u8; 16];
-        openssl::rand::rand_bytes(&mut iv)?;
+        rand::fill(&mut iv)?;
         let ciphertext = self.encrypt_bytes_with_iv(cleartext_bytes, &iv)?;
         Ok((ciphertext, iv))
     }
@@ -171,13 +154,12 @@ impl KeyBundle {
 mod test {
     use super::*;
 
-    static HMAC_B16: &'static str =
-        "b1e6c18ac30deb70236bc0d65a46f7a4dce3b8b0e02cf92182b914e3afa5eebc";
-    static IV_B64: &'static str = "GX8L37AAb2FZJMzIoXlX8w==";
-    static HMAC_KEY_B64: &'static str = "MMntEfutgLTc8FlTLQFms8/xMPmCldqPlq/QQXEjx70=";
-    static ENC_KEY_B64: &'static str = "9K/wLdXdw+nrTtXo4ZpECyHFNr4d7aYHqeg3KW9+m6Q=";
+    const HMAC_B16: &str = "b1e6c18ac30deb70236bc0d65a46f7a4dce3b8b0e02cf92182b914e3afa5eebc";
+    const IV_B64: &str = "GX8L37AAb2FZJMzIoXlX8w==";
+    const HMAC_KEY_B64: &str = "MMntEfutgLTc8FlTLQFms8/xMPmCldqPlq/QQXEjx70=";
+    const ENC_KEY_B64: &str = "9K/wLdXdw+nrTtXo4ZpECyHFNr4d7aYHqeg3KW9+m6Q=";
 
-    static CIPHERTEXT_B64_PIECES: &'static [&'static str] = &[
+    const CIPHERTEXT_B64_PIECES: &[&str] = &[
         "NMsdnRulLwQsVcwxKW9XwaUe7ouJk5Wn80QhbD80l0HEcZGCynh45qIbeYBik0lgcHbK",
         "mlIxTJNwU+OeqipN+/j7MqhjKOGIlvbpiPQQLC6/ffF2vbzL0nzMUuSyvaQzyGGkSYM2",
         "xUFt06aNivoQTvU2GgGmUK6MvadoY38hhW2LCMkoZcNfgCqJ26lO1O0sEO6zHsk3IVz6",
@@ -187,7 +169,7 @@ mod test {
         "jOoRSLx7GG86wT59QZw=",
     ];
 
-    static CLEARTEXT_B64_PIECES: &'static [&'static str] = &[
+    const CLEARTEXT_B64_PIECES: &[&str] = &[
         "eyJpZCI6IjVxUnNnWFdSSlpYciIsImhpc3RVcmkiOiJmaWxlOi8vL1VzZXJzL2phc29u",
         "L0xpYnJhcnkvQXBwbGljYXRpb24lMjBTdXBwb3J0L0ZpcmVmb3gvUHJvZmlsZXMva3Nn",
         "ZDd3cGsuTG9jYWxTeW5jU2VydmVyL3dlYXZlL2xvZ3MvIiwidGl0bGUiOiJJbmRleCBv",
@@ -202,7 +184,7 @@ mod test {
         let ciphertext_base64 = CIPHERTEXT_B64_PIECES.join("");
         assert!(key_bundle
             .verify_hmac_string(HMAC_B16, &ciphertext_base64)
-            .unwrap());
+            .is_ok());
     }
 
     #[test]

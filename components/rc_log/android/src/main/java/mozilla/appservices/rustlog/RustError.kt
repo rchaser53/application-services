@@ -6,11 +6,11 @@ package mozilla.appservices.rustlog
 
 import com.sun.jna.Pointer
 import com.sun.jna.Structure
-import java.util.Arrays
 
 /**
  * This should be considered private, but it needs to be public for JNA.
  */
+@Structure.FieldOrder("code", "message")
 open class RustError : Structure() {
 
     class ByReference : RustError(), Structure.ByReference
@@ -18,12 +18,8 @@ open class RustError : Structure() {
     @JvmField var code: Int = 0
     @JvmField var message: Pointer? = null
 
-    init {
-        read()
-    }
-
     fun isFailure(): Boolean {
-        return code != 0;
+        return code != 0
     }
 
     /**
@@ -34,12 +30,8 @@ open class RustError : Structure() {
         val result = this.message?.getAndConsumeRustString()
         this.message = null
         if (result == null) {
-            throw NullPointerException("consumeErrorMessage called with null message!");
+            throw NullPointerException("consumeErrorMessage called with null message!")
         }
         return result
-    }
-
-    override fun getFieldOrder(): List<String> {
-        return Arrays.asList("code", "message")
     }
 }

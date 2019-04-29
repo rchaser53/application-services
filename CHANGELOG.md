@@ -2,7 +2,423 @@
 
 **See [the release process docs](docs/howtos/cut-a-new-release.md) for the steps to take when cutting a new release.**
 
-[Full Changelog](https://github.com/mozilla/application-services/compare/v0.17.0...master)
+[Full Changelog](https://github.com/mozilla/application-services/compare/v0.27.1...master)
+
+# v0.27.1 (_2019-04-26_)
+
+[Full Changelog](https://github.com/mozilla/application-services/compare/v0.27.0...v0.27.1)
+
+## FxA
+
+### What's New
+
+- Added `destroyDevice` support to existing Send Tab capabilities. ([#821](https://github.com/mozilla/application-services/pull/821))
+
+## Places
+
+### What's New
+
+- Frecencies are now recalculated for bookmarked URLs after a sync.
+  ([#847](https://github.com/mozilla/application-services/issues/847))
+
+## Push
+
+### What's Fixed
+
+- Authentication failures with the autopush server should be fixed. ([#1080](https://github.com/mozilla/application-services/pull/1080))
+
+# v0.27.0 (_2019-04-22_)
+
+[Full Changelog](https://github.com/mozilla/application-services/compare/v0.26.2...v0.27.0)
+
+## General
+
+- JNA has been updated to version 5.2.0 (previously 4.5.2) ([#1057](https://github.com/mozilla/application-services/pull/1057))
+
+- SQLCipher has been updated to version 4.1.0 (previously 4.0.0) ([#1060](https://github.com/mozilla/application-services/pull/1060))
+
+- `android-components` has been updated to 0.50.0 (previously 0.49.0) ([#1062](https://github.com/mozilla/application-services/pull/1062))
+
+- SQLCipher should no longer be required in megazords which do not contain `logins`. ([#996](https://github.com/mozilla/application-services/pull/996))
+
+- Non-megazord builds should once again work ([#1046](https://github.com/mozilla/application-services/pull/1046))
+
+## FxA
+
+### What's New
+
+- New methods `getManageAccountURL` and `getManageDevicesURL` have been added,
+  which the application can use to direct the user to manage their account on the web.
+  ([#984](https://github.com/mozilla/application-services/pull/984))
+- Android only: Added device registration and Firefox Send Tab capability support. Your app can opt into this by calling the `FirefoxAccount.initializeDevice` method. ([#676](https://github.com/mozilla/application-services/pull/676))
+
+- Switched to use the new fxa-auth-server token endpoint which generates device records, email and push notifications
+ for connected clients([#1055](https://github.com/mozilla/application-services/pull/1055))
+
+## Places
+
+### Breaking Changes
+
+- It is no longer possible to create an encrypted places database. ([#950](https://github.com/mozilla/application-services/issues/950))
+- `syncBookmarks()` API is now marked `open` to be accessible outside the framework. ([#1058](https://github.com/mozilla/application-services/issues/1058))
+
+### What's Fixed
+
+- Non-megazord builds should once again function. ([#1045](https://github.com/mozilla/application-services/issues/1045))
+
+# v0.26.2 (_2019-04-18_)
+
+[Full Changelog](https://github.com/mozilla/application-services/compare/v0.26.1...v0.26.2)
+
+## iOS Framework
+
+### What's Fixed
+
+- iOS temporarially no longer uses NSS for crypto. This is a short term fix to
+  allow firefox-ios to release an update.
+
+# v0.26.1 (_2019-04-18_)
+
+[Full Changelog](https://github.com/mozilla/application-services/compare/v0.26.0...v0.26.1)
+
+## iOS Framework
+
+### What's Fixed
+
+- iOS networking should use the reqwest backend, instead of failing ([#1032](https://github.com/mozilla/application-services/pull/1032))
+
+# v0.26.0 (_2019-04-17_)
+
+[Full Changelog](https://github.com/mozilla/application-services/compare/v0.25.2...v0.26.0)
+
+## Gradle plugin
+
+- Removed the appservices bintray repo from the plugin ([#899](https://github.com/mozilla/application-services/issues/899))
+
+## Push
+
+### Breaking Change
+
+- `PushAPI.subscribe()` now returns a `SubscriptionResponse` that contains the server supplied `channelID` and the
+   `subscriptionInfo` block previously returned. Please note: the server supplied `channelID` may differ from the
+   supplied `channelID` argument. This is definitely true when an empty channelID value is provided to `subscribe()`,
+   or if the channelID is not a proper UUID.
+   The returned `channelID` value is authoritative and will be the value associated with the subscription and future
+   subscription updates. As before, the `subscriptionResponse.subscriptionInfo` can be JSON serialized and returned to the application.
+   ([#988](https://github.com/mozilla/application-services/pull/988))
+
+## Places
+
+### What's new
+
+- Bookmarks may now be synced using the `syncBookmarks` method on `PlacesApi`
+  (and on Android, the interface it implements, `SyncManager`).
+  ([#850](https://github.com/mozilla/application-services/issues/850))
+- Android only: New methods for querying paginated history have been added:
+  `getVisitCount` and `getVisitPage`
+  ([#992](https://github.com/mozilla/application-services/issues/992))
+- Android only: `getVisitInfos` now takes a list of visit types to exclude.
+  ([#920](https://github.com/mozilla/application-services/issues/920))
+
+### Breaking Changes
+
+- Android only: The addition of `syncBookmarks` on the `PlacesManager` interface
+  is a breaking change. ([#850](https://github.com/mozilla/application-services/issues/850))
+- Android only: `sync` has been renamed to `syncHistory` for clarity given the
+  existence of `syncBookmarks`.
+  ([#850](https://github.com/mozilla/application-services/issues/850))
+- Android only: `getVisitInfos` has changed, which is breaking for implementors
+  of `ReadableHistoryConnection`.
+  ([#920](https://github.com/mozilla/application-services/issues/920))
+- Android only: New methods on `ReadableHistoryConnection`: `getVisitCount` and
+  `getVisitPage`.
+  ([#992](https://github.com/mozilla/application-services/issues/992))
+
+## Logins
+
+### What's new
+
+- iOS only: Logins operations may now be interrupted via the `interrupt()`
+  method on LoginsDb, which may be called from any thread.
+  ([#884](https://github.com/mozilla/application-services/issues/884))
+    - This is currently only implemented for iOS due to lack of interest on the
+      Android side, please let us know if this is desirable in the Android API
+      as well. Feel free to indicate support for exposing this in the Android API
+      [here](https://github.com/mozilla/application-services/issues/1020).
+
+# v0.25.2 (_2019-04-11_)
+
+[Full Changelog](https://github.com/mozilla/application-services/compare/v0.24.0...v0.25.2)
+
+## General
+
+- Some cryptographic primitives are now backed by NSS. On reference-browser and fenix megazords the GeckoView NSS libs are used, otherwise these libraries are bundled. ([#891](https://github.com/mozilla/application-services/pull/891))
+
+### What's Fixed
+
+- Megazords and requests should work again. ([#946](https://github.com/mozilla/application-services/pull/946))
+- The vestigial `reqwest` backend is no longer compiled into the megazords ([#937](https://github.com/mozilla/application-services/pull/937)).
+    - Note that prior to this it was present, but unused.
+
+## iOS
+
+- The individual components projects have been removed, please use the MozillaAppServices framework from now on. ([#932](https://github.com/mozilla/application-services/pull/932))
+- The NSS .dylibs must be included in your application project, see [instructions](https://github.com/mozilla/application-services/blob/30a1a57917c6e243c0c5d59fba24caa8de8f6b3a/docs/howtos/consuming-rust-components-on-ios.md#nss)
+
+## Push
+
+### What's fixed
+
+- PushAPI now stores some metadata information across restarts ([#905](https://github.com/mozilla/application-services/issues/905))
+
+# v0.24.0 (_2019-04-08_)
+
+[Full Changelog](https://github.com/mozilla/application-services/compare/v0.23.0...v0.24.0)
+
+## Megazords
+
+## Breaking Changes
+
+- Megazord initialization has changed. Megazords' init() function now takes a
+  `Lazy<mozilla.components.concept.fetch.Client>` (from
+  [concept-fetch](https://github.com/mozilla-mobile/android-components/tree/master/components/concept/fetch/)),
+  which will be used to proxy all HTTP requests through. It will not be accessed
+  until a method is called on rust code which requires the network. This
+  functionality is not present in non-megazords. ([#835](https://github.com/mozilla/application-services/pull/835))
+
+    An example of how to initialize this follows:
+
+    ```kotlin
+    val megazordClass = Class.forName("mozilla.appservices.MyCoolMegazord")
+    val megazordInitMethod = megazordClass.getDeclaredMethod("init", Lazy::class.java)
+    val lazyClient: Lazy<Client> = lazy { components.core.client }
+    megazordInitMethod.invoke(megazordClass, lazyClient)
+    ```
+
+    Or (if you don't have GeckoView available, e.g. in the case of lockbox):
+
+    ```kotlin
+    val megazordClass = Class.forName("mozilla.appservices.MyCoolMegazord")
+    val megazordInitMethod = megazordClass.getDeclaredMethod("init", Lazy::class.java)
+    // HttpURLConnectionClient is from mozilla.components.lib.fetch.httpurlconnection
+    val lazyClient: Lazy<Client> = lazy { HttpURLConnectionClient() }
+    megazordInitMethod.invoke(megazordClass, lazyClient)
+    ```
+
+## General
+
+- Native code builds are now stripped by default, reducing size by almost an
+  order of magnitude. ([#913](https://github.com/mozilla/application-services/issues/913))
+    - This is done rather than relying on consumers to strip them, which proved
+      more difficult than anticipated.
+
+## Push
+
+### What's new
+
+- PushAPI now defines a number of default parameters for functions ([#868](https://github.com/mozilla/application-services/issues/868))
+
+### Breaking changes
+
+- `mozilla.appservices.push.BridgeTypes` is now
+  `mozilla.appservices.push.BridgeType`
+([#885](https://github.com/mozilla/application-services/issues/885))
+
+## Places
+
+### What's Fixed
+
+- Swift PlacesAPI methods are not externally accessible
+  ([#928](https://github.com/mozilla/application-services/issues/928))
+
+# v0.23.0 (_2019-03-29_)
+
+[Full Changelog](https://github.com/mozilla/application-services/compare/v0.22.1...v0.23.0)
+
+## Places
+
+### What's Fixed
+
+- createBookmarkItem on android will now create the correct type of bookmark.
+  ([#880](https://github.com/mozilla/application-services/issues/880))
+
+## Push
+
+### Breaking changes
+
+- the `PushManager` argument `socket_protocol` is now `http_protocol`
+  to correctly map its role. `socket_protocol` is reserved.
+
+# v0.22.1 (_2019-03-27_)
+
+[Full Changelog](https://github.com/mozilla/application-services/compare/v0.22.0...v0.22.1)
+
+## Logins
+
+### What's New
+
+- iOS Logins storage now has `ensureLocked`, `ensureUnlocked`, and `wipeLocal`
+  methods, equivalent to those provided in the android API.
+  ([#854](https://github.com/mozilla/application-services/issues/854))
+
+## Places
+
+### What's Fixed
+
+- PlacesAPIs should now be closed when all references to them are no longer used.
+  ([#749](https://github.com/mozilla/application-services/issues/749))
+
+# v0.22.0 (_2019-03-22_)
+
+[Full Changelog](https://github.com/mozilla/application-services/compare/v0.21.0...v0.22.0)
+
+## Logins
+
+- Added a disableMemSecurity function to turn off some dubious behaviors of SQLcipher. ([#838](https://github.com/mozilla/application-services/pull/838))
+- The iOS SQLCipher build configuration has been adjusted ([#837](https://github.com/mozilla/application-services/pull/837))
+
+## Push
+
+### Breaking changes
+
+- `PushManager`'s `dispatch_for_chid` method has been renamed to `dispatchForChid`.
+- `PushManager` constructor arguments are now camelCased.
+
+## `org.mozilla.appservices` Gradle plugin
+
+- Artifacts are now to be published to the `mozilla-appservices` bintray organization.  This necessitates version 0.4.3 of the Gradle plugin.  ([#843](https://github.com/mozilla/application-services/issues/843))
+
+# v0.21.0 (_2019-03-20_)
+
+[Full Changelog](https://github.com/mozilla/application-services/compare/v0.20.2...v0.21.0)
+
+## General
+
+- Breakpad symbols should be available for android now ([#741](https://github.com/mozilla/application-services/pull/741))
+
+## Places
+
+- Places now is available on iOS, however support is limited to Bookmarks. ([#743](https://github.com/mozilla/application-services/pull/743))
+- Places now has bookmarks support enabled in the FFI. This addition is too large to include in the changelog, however both Swift and Kotlin APIs for this are fairly well documented. ([#743](https://github.com/mozilla/application-services/pull/743))
+
+
+# v0.20.2 (_2019-03-15_)
+
+[Full Changelog](https://github.com/mozilla/application-services/compare/v0.20.1...v0.20.2)
+
+- An automation problem with the previous release, forcing a version bump. No functional changes.
+- Local development: non-megazord builds are now `debug` be default, improving local build times
+and working around subtle build issues.
+- Override this via a flag in `local.properties`: `application-services.nonmegazord-profile=release`
+
+# v0.20.1 (_2019-03-15_)
+
+[Full Changelog](https://github.com/mozilla/application-services/compare/v0.20.0...v0.20.1)
+
+- A error in the build.gradle file caused the v0.20.0 release to fail, this
+  release should not be meaningfully different from it.
+
+# v0.20.0 (_2019-03-14_)
+
+[Full Changelog](https://github.com/mozilla/application-services/compare/v0.19.0...v0.20.0)
+
+## General
+
+- The previous release had an issue with the megazords, and so another
+  release was needed. This is version 0.4.2 of the megazord plugin.
+  ([#775](https://github.com/mozilla/application-services/pull/775))
+
+### Breaking Changes
+
+- All package names have been normalized. The gradle packages should all be
+  `org.mozilla.appservices:component`, and the java namespaces should be
+  `mozilla.appservices.component`. ([#776](https://github.com/mozilla/application-services/pull/776))
+
+## Logins
+
+### Breaking Changes
+
+- The gradle package for logins has been changed from
+  `'org.mozilla.sync15:logins'` to `org.mozilla.appservices:logins`.
+  ([#776](https://github.com/mozilla/application-services/pull/776))
+
+## Places
+
+### Breaking Changes
+
+- Several classes and interfaces have been renamed after feedback from consumers
+  to avoid `Interface` in the name, and better reflect what they provide.
+    - `PlacesApiInterface` => `PlacesManager`
+    - `PlacesConnectionInterface` => `InterruptibleConnection`
+    - `ReadablePlacesConnectionInterface` => `ReadableHistoryConnection`
+    - `WritablePlacesConnectionInterface` => `WritableHistoryConnection`
+    - `ReadablePlacesConnection` => `PlacesReaderConnection`
+    - `WritablePlacesConnection` => `PlacesWriterConnection`
+
+- The java namespace used in places has changed from `org.mozilla.places` to
+  `mozilla.appservices.places`
+  ([#776](https://github.com/mozilla/application-services/pull/776))
+
+- The gradle package for places has been changed from
+  `'org.mozilla.places:places'` to `org.mozilla.appservices:places`.
+  ([#776](https://github.com/mozilla/application-services/pull/776))
+
+## FxA
+
+### Breaking Changes
+
+- The gradle package for fxa-client has been changed from
+  `'org.mozilla.fxaclient:fxaclient'` to `org.mozilla.appservices:fxaclient`.
+  ([#776](https://github.com/mozilla/application-services/pull/776))
+
+# 0.19.0 (_2019-03-13_)
+
+[Full Changelog](https://github.com/mozilla/application-services/compare/v0.18.0...v0.19.0)
+
+## General
+
+### What's New
+
+- Initial support for the new Push component landed, however it's not yet ready
+  for widespread use ([#683](https://github.com/mozilla/application-services/pull/683))
+
+## Places
+
+### What's New
+
+- A massive rewrite of the Kotlin API has been completed. This distinguishes
+  reader and writer connections. A brief description of the new types follows.
+  Note that all the types have corresponding interfaces that allow for them to
+  be mocked during testing as needed. ([#718](https://github.com/mozilla/application-services/pull/718))
+    - `PlacesApi`: This is similar to a connection pool, it exists to give out
+      reader and writer connections via the functions `openReader` and
+      `getWriter`. The naming distinction is due to there only being a single
+      writer connection (which is actually opened when the `PlacesApi` is
+      created). This class generally should be a singleton.
+        - In addition to `openReader` and `getWriter`, this also includes the
+        `sync()` method, as that requires a special type of connection.
+    - `ReadablePlacesConnection`: This is a read-only connection to the places
+      database, implements all the methods of the API that do not require write
+      access.
+        - Specifically, `getVisited`, `matchUrl`, `queryAutocomplete`, `interrupt`,
+          `getVisitedUrlsInRange`, and `getVisitInfos` all exist on this object.
+    - `WritablePlacesConnection`: This is a read-write connection, and as such,
+      contains not only the all reader methods mentioned above, but also the
+      methods requiring write access, such as:
+        - `noteObservation`, `wipeLocal`, `runMaintenance`, `pruneDestructively`,
+          `deleteEverything`, `deletePlace`, `deleteVisitsSince`, `deleteVisitsBetween`,
+          and `deleteVisit`.
+    - Note that the semantics of the various methods have not been changed, only
+      their location.
+
+### Breaking Changes
+
+- Almost the entire API has been rewritten. See "What's New" for
+  details. ([#718](https://github.com/mozilla/application-services/pull/718))
+
+# 0.18.0 (_2019-02-27_)
+
+[Full Changelog](https://github.com/mozilla/application-services/compare/v0.17.0...v0.18.0)
 
 ## FxA
 

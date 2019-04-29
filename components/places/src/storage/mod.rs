@@ -7,13 +7,15 @@
 
 pub mod bookmarks;
 pub mod history;
+pub mod tags;
 
+use crate::db::PlacesDb;
 use crate::error::{ErrorKind, InvalidPlaceInfo, Result};
 use crate::msg_types::HistoryVisitInfo;
 use crate::types::{SyncGuid, SyncStatus, Timestamp, VisitTransition};
 use rusqlite::types::{FromSql, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use rusqlite::Result as RusqliteResult;
-use rusqlite::{Connection, Row};
+use rusqlite::Row;
 use serde_derive::*;
 use sql_support::{self, ConnExt};
 use std::fmt;
@@ -22,6 +24,7 @@ use url::Url;
 /// From https://searchfox.org/mozilla-central/rev/93905b660f/toolkit/components/places/PlacesUtils.jsm#189
 pub const URL_LENGTH_MAX: usize = 65536;
 pub const TITLE_LENGTH_MAX: usize = 4096;
+pub const TAG_LENGTH_MAX: usize = 100;
 // pub const DESCRIPTION_LENGTH_MAX: usize = 256;
 
 // Typesafe way to manage RowIds. Does it make sense? A better way?
@@ -38,20 +41,20 @@ impl From<RowId> for i64 {
 
 impl fmt::Display for RowId {
     #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
 impl ToSql for RowId {
-    fn to_sql(&self) -> RusqliteResult<ToSqlOutput> {
+    fn to_sql(&self) -> RusqliteResult<ToSqlOutput<'_>> {
         Ok(ToSqlOutput::from(self.0))
     }
 }
 
 impl FromSql for RowId {
-    fn column_result(value: ValueRef) -> FromSqlResult<Self> {
-        value.as_i64().map(|v| RowId(v))
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        value.as_i64().map(RowId)
     }
 }
 
@@ -73,31 +76,29 @@ pub struct PageInfo {
 }
 
 impl PageInfo {
-    pub fn from_row(row: &Row) -> Result<Self> {
+    pub fn from_row(row: &Row<'_>) -> Result<Self> {
         Ok(Self {
-            url: Url::parse(&row.get_checked::<_, String>("url")?)?,
-            guid: SyncGuid(row.get_checked::<_, String>("guid")?),
-            row_id: row.get_checked("id")?,
-            title: row
-                .get_checked::<_, Option<String>>("title")?
-                .unwrap_or_default(),
-            hidden: row.get_checked("hidden")?,
-            typed: row.get_checked("typed")?,
+            url: Url::parse(&row.get::<_, String>("url")?)?,
+            guid: row.get::<_, String>("guid")?.into(),
+            row_id: row.get("id")?,
+            title: row.get::<_, Option<String>>("title")?.unwrap_or_default(),
+            hidden: row.get("hidden")?,
+            typed: row.get("typed")?,
 
-            frecency: row.get_checked("frecency")?,
-            visit_count_local: row.get_checked("visit_count_local")?,
-            visit_count_remote: row.get_checked("visit_count_remote")?,
+            frecency: row.get("frecency")?,
+            visit_count_local: row.get("visit_count_local")?,
+            visit_count_remote: row.get("visit_count_remote")?,
 
             last_visit_date_local: row
-                .get_checked::<_, Option<Timestamp>>("last_visit_date_local")?
+                .get::<_, Option<Timestamp>>("last_visit_date_local")?
                 .unwrap_or_default(),
             last_visit_date_remote: row
-                .get_checked::<_, Option<Timestamp>>("last_visit_date_remote")?
+                .get::<_, Option<Timestamp>>("last_visit_date_remote")?
                 .unwrap_or_default(),
 
-            sync_status: SyncStatus::from_u8(row.get_checked::<_, u8>("sync_status")?),
+            sync_status: SyncStatus::from_u8(row.get::<_, u8>("sync_status")?),
             sync_change_counter: row
-                .get_checked::<_, Option<u32>>("sync_change_counter")?
+                .get::<_, Option<u32>>("sync_change_counter")?
                 .unwrap_or_default(),
         })
     }
@@ -113,16 +114,16 @@ struct FetchedPageInfo {
 }
 
 impl FetchedPageInfo {
-    pub fn from_row(row: &Row) -> Result<Self> {
+    pub fn from_row(row: &Row<'_>) -> Result<Self> {
         Ok(Self {
             page: PageInfo::from_row(row)?,
-            last_visit_id: row.get_checked::<_, Option<RowId>>("last_visit_id")?,
+            last_visit_id: row.get::<_, Option<RowId>>("last_visit_id")?,
         })
     }
 }
 
 // History::FetchPageInfo
-fn fetch_page_info(db: &impl ConnExt, url: &Url) -> Result<Option<FetchedPageInfo>> {
+fn fetch_page_info(db: &PlacesDb, url: &Url) -> Result<Option<FetchedPageInfo>> {
     let sql = "
       SELECT guid, url, id, title, hidden, typed, frecency,
              visit_count_local, visit_count_remote,
@@ -142,7 +143,7 @@ fn fetch_page_info(db: &impl ConnExt, url: &Url) -> Result<Option<FetchedPageInf
     )?)
 }
 
-fn new_page_info(db: &impl ConnExt, url: &Url, new_guid: Option<SyncGuid>) -> Result<PageInfo> {
+fn new_page_info(db: &PlacesDb, url: &Url, new_guid: Option<SyncGuid>) -> Result<PageInfo> {
     let guid = match new_guid {
         Some(guid) => guid,
         None => SyncGuid::new(),
@@ -173,28 +174,28 @@ fn new_page_info(db: &impl ConnExt, url: &Url, new_guid: Option<SyncGuid>) -> Re
 }
 
 impl HistoryVisitInfo {
-    pub(crate) fn from_row(row: &rusqlite::Row) -> Result<Self> {
-        let visit_type = VisitTransition::from_primitive(row.get_checked::<_, u8>("visit_type")?)
+    pub(crate) fn from_row(row: &rusqlite::Row<'_>) -> Result<Self> {
+        let visit_type = VisitTransition::from_primitive(row.get::<_, u8>("visit_type")?)
             // Do we have an existing error we use for this? For now they
             // probably don't care too much about VisitTransition, so this
             // is fine.
             .unwrap_or(VisitTransition::Link);
-        let visit_date: Timestamp = row.get_checked("visit_date")?;
+        let visit_date: Timestamp = row.get("visit_date")?;
         Ok(Self {
-            url: row.get_checked("url")?,
-            title: row.get_checked("title")?,
+            url: row.get("url")?,
+            title: row.get("title")?,
             timestamp: visit_date.0 as i64,
             visit_type: visit_type as i32,
         })
     }
 }
 
-pub fn run_maintenance(conn: &impl ConnExt) -> Result<()> {
+pub fn run_maintenance(conn: &PlacesDb) -> Result<()> {
     conn.execute_all(&["VACUUM", "PRAGMA optimize"])?;
     Ok(())
 }
 
-pub(crate) fn put_meta(db: &Connection, key: &str, value: &ToSql) -> Result<()> {
+pub(crate) fn put_meta(db: &PlacesDb, key: &str, value: &dyn ToSql) -> Result<()> {
     db.execute_named_cached(
         "REPLACE INTO moz_meta (key, value) VALUES (:key, :value)",
         &[(":key", &key), (":value", value)],
@@ -202,7 +203,7 @@ pub(crate) fn put_meta(db: &Connection, key: &str, value: &ToSql) -> Result<()> 
     Ok(())
 }
 
-pub(crate) fn get_meta<T: FromSql>(db: &Connection, key: &str) -> Result<Option<T>> {
+pub(crate) fn get_meta<T: FromSql>(db: &PlacesDb, key: &str) -> Result<Option<T>> {
     let res = db.try_query_one(
         "SELECT value FROM moz_meta WHERE key = :key",
         &[(":key", &key)],
@@ -211,12 +212,45 @@ pub(crate) fn get_meta<T: FromSql>(db: &Connection, key: &str) -> Result<Option<
     Ok(res)
 }
 
+pub(crate) fn delete_meta(db: &PlacesDb, key: &str) -> Result<()> {
+    db.execute_named_cached("DELETE FROM moz_meta WHERE key = :key", &[(":key", &key)])?;
+    Ok(())
+}
+
 /// Delete all items in the temp tables we use for staging changes.
-pub(crate) fn delete_pending_temp_tables(conn: &Connection) -> Result<()> {
+pub(crate) fn delete_pending_temp_tables(conn: &PlacesDb) -> Result<()> {
     conn.execute_batch(
         "DELETE FROM moz_updateoriginsupdate_temp;
          DELETE FROM moz_updateoriginsdelete_temp;
          DELETE FROM moz_updateoriginsinsert_temp;",
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::places_api::test::new_mem_connection;
+
+    #[test]
+    fn test_meta() {
+        let conn = new_mem_connection();
+        let value1 = "value 1".to_string();
+        let value2 = "value 2".to_string();
+        assert!(get_meta::<String>(&conn, "foo")
+            .expect("should get")
+            .is_none());
+        put_meta(&conn, "foo", &value1).expect("should put");
+        assert_eq!(
+            get_meta(&conn, "foo").expect("should get new val"),
+            Some(value1)
+        );
+        put_meta(&conn, "foo", &value2).expect("should put an existing value");
+        assert_eq!(get_meta(&conn, "foo").expect("should get"), Some(value2));
+        delete_meta(&conn, "foo").expect("should delete");
+        assert!(get_meta::<String>(&conn, &"foo")
+            .expect("should get non-existing")
+            .is_none());
+        delete_meta(&conn, "foo").expect("delete non-existing should work");
+    }
 }

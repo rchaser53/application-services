@@ -128,7 +128,8 @@ pub fn split_after_host_and_port(href: &str) -> (&str, &str) {
         .map(|i| i + 1)
         .unwrap_or(0);
     let remainder = &remainder[start..];
-    let end = memchr::memchr3(b'/', b'?', b'#', remainder.as_bytes()).unwrap_or(remainder.len());
+    let end =
+        memchr::memchr3(b'/', b'?', b'#', remainder.as_bytes()).unwrap_or_else(|| remainder.len());
     remainder.split_at(end)
 }
 
@@ -183,20 +184,20 @@ pub struct SearchResult {
 impl SearchResult {
     /// Default search behaviors from Desktop: HISTORY, BOOKMARK, OPENPAGE, SEARCHES.
     /// Default match behavior: MATCH_BOUNDARY_ANYWHERE.
-    pub fn from_adaptive_row(row: &rusqlite::Row) -> rusqlite::Result<Self> {
+    pub fn from_adaptive_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         let mut reasons = vec![MatchReason::PreviousUse];
 
-        let search_string = row.get_checked::<_, String>("searchString")?;
-        let _place_id = row.get_checked::<_, i64>("id")?;
-        let url = row.get_checked::<_, String>("url")?;
-        let history_title = row.get_checked::<_, Option<String>>("title")?;
-        let bookmarked = row.get_checked::<_, bool>("bookmarked")?;
-        let bookmark_title = row.get_checked::<_, Option<String>>("btitle")?;
-        let frecency = row.get_checked::<_, i64>("frecency")?;
+        let search_string = row.get::<_, String>("searchString")?;
+        let _place_id = row.get::<_, i64>("id")?;
+        let url = row.get::<_, String>("url")?;
+        let history_title = row.get::<_, Option<String>>("title")?;
+        let bookmarked = row.get::<_, bool>("bookmarked")?;
+        let bookmark_title = row.get::<_, Option<String>>("btitle")?;
+        let frecency = row.get::<_, i64>("frecency")?;
 
         let title = bookmark_title.or_else(|| history_title).unwrap_or_default();
 
-        let tags = row.get_checked::<_, Option<String>>("tags")?;
+        let tags = row.get::<_, Option<String>>("tags")?;
         if let Some(tags) = tags {
             reasons.push(MatchReason::Tags(tags));
         }
@@ -215,23 +216,23 @@ impl SearchResult {
         })
     }
 
-    pub fn from_suggestion_row(row: &rusqlite::Row) -> rusqlite::Result<Self> {
+    pub fn from_suggestion_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         let mut reasons = vec![MatchReason::Bookmark];
 
-        let search_string = row.get_checked::<_, String>("searchString")?;
-        let url = row.get_checked::<_, String>("url")?;
+        let search_string = row.get::<_, String>("searchString")?;
+        let url = row.get::<_, String>("url")?;
 
-        let history_title = row.get_checked::<_, Option<String>>("title")?;
-        let bookmark_title = row.get_checked::<_, Option<String>>("btitle")?;
+        let history_title = row.get::<_, Option<String>>("title")?;
+        let bookmark_title = row.get::<_, Option<String>>("btitle")?;
         let title = bookmark_title.or_else(|| history_title).unwrap_or_default();
 
-        let tags = row.get_checked::<_, Option<String>>("tags")?;
+        let tags = row.get::<_, Option<String>>("tags")?;
         if let Some(tags) = tags {
             reasons.push(MatchReason::Tags(tags));
         }
         let url = Url::parse(&url).expect("Invalid URL in Places");
 
-        let frecency = row.get_checked::<_, i64>("frecency")?;
+        let frecency = row.get::<_, i64>("frecency")?;
 
         Ok(Self {
             search_string,
@@ -243,11 +244,11 @@ impl SearchResult {
         })
     }
 
-    pub fn from_origin_row(row: &rusqlite::Row) -> rusqlite::Result<Self> {
-        let search_string = row.get_checked::<_, String>("searchString")?;
-        let url = row.get_checked::<_, String>("url")?;
-        let display_url = row.get_checked::<_, String>("displayURL")?;
-        let frecency = row.get_checked::<_, i64>("frecency")?;
+    pub fn from_origin_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        let search_string = row.get::<_, String>("searchString")?;
+        let url = row.get::<_, String>("url")?;
+        let display_url = row.get::<_, String>("displayURL")?;
+        let frecency = row.get::<_, i64>("frecency")?;
 
         let url = Url::parse(&url).expect("Invalid URL in Places");
 
@@ -261,12 +262,12 @@ impl SearchResult {
         })
     }
 
-    pub fn from_url_row(row: &rusqlite::Row) -> rusqlite::Result<Self> {
-        let search_string = row.get_checked::<_, String>("searchString")?;
-        let href = row.get_checked::<_, String>("url")?;
-        let stripped_url = row.get_checked::<_, String>("strippedURL")?;
-        let frecency = row.get_checked::<_, i64>("frecency")?;
-        let bookmarked = row.get_checked::<_, bool>("bookmarked")?;
+    pub fn from_url_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        let search_string = row.get::<_, String>("searchString")?;
+        let href = row.get::<_, String>("url")?;
+        let stripped_url = row.get::<_, String>("strippedURL")?;
+        let frecency = row.get::<_, i64>("frecency")?;
+        let bookmarked = row.get::<_, bool>("bookmarked")?;
 
         let mut reasons = vec![MatchReason::Url];
         if bookmarked {
@@ -318,7 +319,7 @@ impl<'query> OriginOrUrl<'query> {
     }
 }
 
-const URL_SQL: &'static str = "
+const URL_SQL: &str = "
     SELECT h.url as url,
             :host || :remainder AS strippedURL,
             h.frecency as frecency,
@@ -347,7 +348,7 @@ const URL_SQL: &'static str = "
     ORDER BY h.frecency DESC, h.id DESC
     LIMIT 1
 ";
-const ORIGIN_SQL: &'static str = "
+const ORIGIN_SQL: &str = "
     SELECT IFNULL(:prefix, prefix) || moz_origins.host || '/' AS url,
             moz_origins.host || '/' AS displayURL,
             frecency,
@@ -545,6 +546,7 @@ impl<'query> Matcher for Suggestions<'query> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::places_api::test::new_mem_connection;
     use crate::observation::VisitObservation;
     use crate::storage::history::apply_observation;
     use crate::types::{Timestamp, VisitTransition};
@@ -578,7 +580,7 @@ mod tests {
 
     #[test]
     fn search() {
-        let mut conn = PlacesDb::open_in_memory(None).expect("no memory db");
+        let conn = new_mem_connection();
 
         let url = Url::parse("http://example.com/123").unwrap();
         let visit = VisitObservation::new(url.clone())
@@ -586,7 +588,7 @@ mod tests {
             .with_visit_type(VisitTransition::Typed)
             .with_at(Timestamp::now());
 
-        apply_observation(&mut conn, visit).expect("Should apply visit");
+        apply_observation(&conn, visit).expect("Should apply visit");
 
         let by_origin = search_frecent(
             &conn,
@@ -601,7 +603,7 @@ mod tests {
             .any(|result| result.search_string == "example.com"
                 && result.title == "example.com/"
                 && result.url.as_str() == "http://example.com/"
-                && result.reasons == &[MatchReason::Origin]));
+                && result.reasons == [MatchReason::Origin]));
 
         let by_url_without_path = search_frecent(
             &conn,
@@ -615,7 +617,7 @@ mod tests {
             .iter()
             .any(|result| result.title == "example.com/"
                 && result.url.as_str() == "http://example.com/"
-                && result.reasons == &[MatchReason::Url]));
+                && result.reasons == [MatchReason::Url]));
 
         let by_url_with_path = search_frecent(
             &conn,
@@ -629,7 +631,7 @@ mod tests {
             .iter()
             .any(|result| result.title == "example.com/123"
                 && result.url.as_str() == "http://example.com/123"
-                && result.reasons == &[MatchReason::Url]));
+                && result.reasons == [MatchReason::Url]));
 
         accept_result(
             &conn,
@@ -656,7 +658,7 @@ mod tests {
             .iter()
             .any(|result| result.search_string == "ample"
                 && result.url == url
-                && result.reasons == &[MatchReason::PreviousUse]));
+                && result.reasons == [MatchReason::PreviousUse]));
 
         let with_limit = search_frecent(
             &conn,
@@ -680,7 +682,7 @@ mod tests {
     }
     #[test]
     fn search_unicode() {
-        let mut conn = PlacesDb::open_in_memory(None).expect("no memory db");
+        let conn = new_mem_connection();
 
         let url = Url::parse("http://exämple.com/123").unwrap();
         let visit = VisitObservation::new(url.clone())
@@ -688,7 +690,7 @@ mod tests {
             .with_visit_type(VisitTransition::Typed)
             .with_at(Timestamp::now());
 
-        apply_observation(&mut conn, visit).expect("Should apply visit");
+        apply_observation(&conn, visit).expect("Should apply visit");
 
         let by_url_without_path = search_frecent(
             &conn,
@@ -703,7 +705,7 @@ mod tests {
             // Should we consider un-punycoding the title? (firefox desktop doesn't...)
             .any(|result| result.title == "xn--exmple-cua.com/"
                 && result.url.as_str() == "http://xn--exmple-cua.com/"
-                && result.reasons == &[MatchReason::Url]));
+                && result.reasons == [MatchReason::Url]));
 
         let by_url_with_path = search_frecent(
             &conn,
@@ -718,7 +720,7 @@ mod tests {
                 .iter()
                 .any(|result| result.title == "xn--exmple-cua.com/123"
                     && result.url.as_str() == "http://xn--exmple-cua.com/123"
-                    && result.reasons == &[MatchReason::Url]),
+                    && result.reasons == [MatchReason::Url]),
             "{:?}",
             by_url_with_path
         );

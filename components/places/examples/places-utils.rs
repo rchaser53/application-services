@@ -2,22 +2,28 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+#![allow(unknown_lints)]
+#![warn(rust_2018_idioms)]
+
 use cli_support::fxa_creds::{get_cli_fxa, get_default_fxa_config};
+use places::bookmark_sync::store::BookmarksStore;
 use places::history_sync::store::HistoryStore;
 use places::storage::bookmarks::{
     fetch_tree, insert_tree, BookmarkNode, BookmarkRootGuid, BookmarkTreeNode, FolderNode,
     SeparatorNode,
 };
 use places::types::{BookmarkType, SyncGuid, Timestamp};
-use places::PlacesDb;
+use places::{ConnectionType, PlacesApi, PlacesDb};
 
 use failure::Fail;
 use serde_derive::*;
-use sql_support::ConnExt;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use structopt::StructOpt;
-use sync15::{telemetry, Store};
+use sync15::{
+    sync_multiple, telemetry, MemoryCachedState, SetupStorageClient, Store, StoreSyncAssociation,
+    Sync15StorageClient,
+};
 use url::Url;
 
 type Result<T> = std::result::Result<T, failure::Error>;
@@ -74,11 +80,7 @@ fn convert_node(dm: DesktopItem) -> Option<BookmarkTreeNode> {
             date_added: dm.date_added.map(|v| Timestamp(v / 1000)),
             last_modified: dm.last_modified.map(|v| Timestamp(v / 1000)),
             title: dm.title,
-            children: dm
-                .children
-                .into_iter()
-                .filter_map(|c| convert_node(c))
-                .collect(),
+            children: dm.children.into_iter().filter_map(convert_node).collect(),
         }
         .into(),
     })
@@ -152,47 +154,96 @@ fn run_native_export(db: &PlacesDb, filename: String) -> Result<()> {
     let file = File::create(filename)?;
     let writer = BufWriter::new(file);
 
-    let tree = fetch_tree(db.conn(), &BookmarkRootGuid::Root.into())?.unwrap();
+    let tree = fetch_tree(db, &BookmarkRootGuid::Root.into())?.unwrap();
     serde_json::to_writer_pretty(writer, &tree)?;
     Ok(())
 }
 
 fn sync(
-    db: &PlacesDb,
-    engine_names: Vec<String>,
+    api: &PlacesApi,
+    mut engine_names: Vec<String>,
     cred_file: String,
+    wipe_all: bool,
     wipe: bool,
     reset: bool,
 ) -> Result<()> {
+    let conn = api.open_sync_connection()?;
+
+    // interrupts are per-connection, so we need to set that up here.
+    let interrupt_handle = conn.new_interrupt_handle();
+
+    ctrlc::set_handler(move || {
+        println!("received Ctrl+C!");
+        interrupt_handle.interrupt();
+    })
+    .expect("Error setting Ctrl-C handler");
+    let interruptee = conn.begin_interrupt_scope();
+
     let cli_fxa = get_cli_fxa(get_default_fxa_config(), &cred_file)?;
 
-    // We will want this as a Vec<sync15::Store> eventually...
-    let stores = if engine_names.len() == 0 {
-        vec![HistoryStore::new(db)]
+    if wipe_all {
+        Sync15StorageClient::new(cli_fxa.client_init.clone())?.wipe_all_remote()?;
+    }
+    // phew - working with traits is making markh's brain melt!
+    // Note also that PlacesApi::sync() exists and ultimately we should
+    // probably end up using that, but it's not yet ready to handle bookmarks.
+    // And until we move to PlacesApi::sync() we simply do not persist any
+    // global state at all (however, we do reuse the in-memory state).
+    let mut mem_cached_state = MemoryCachedState::default();
+    let mut global_state: Option<String> = None;
+    let stores: Vec<Box<dyn Store>> = if engine_names.is_empty() {
+        vec![
+            Box::new(BookmarksStore::new(&conn, &interruptee)),
+            Box::new(HistoryStore::new(&conn, &interruptee)),
+        ]
     } else {
-        assert!(engine_names.len() == 1 && engine_names[0] == "history");
-        vec![HistoryStore::new(db)]
+        engine_names.sort();
+        engine_names.dedup();
+        engine_names
+            .into_iter()
+            .map(|name| -> Box<dyn Store> {
+                match name.as_str() {
+                    "bookmarks" => Box::new(BookmarksStore::new(&conn, &interruptee)),
+                    "history" => Box::new(HistoryStore::new(&conn, &interruptee)),
+                    _ => unimplemented!("Can't sync unsupported engine {}", name),
+                }
+            })
+            .collect()
     };
-    let mut sync_ping = telemetry::SyncTelemetryPing::new();
-    for store in stores {
+    for store in &stores {
         if wipe {
             store.wipe()?;
         }
         if reset {
-            store.reset()?;
+            store.reset(&StoreSyncAssociation::Disconnected)?;
         }
+    }
 
-        log::info!("Syncing {}", store.collection_name());
-        if let Err(e) = store.sync(
-            &cli_fxa.client_init.clone(),
-            &cli_fxa.root_sync_key,
-            &mut sync_ping,
-        ) {
-            log::warn!("Sync failed! {}", e);
-            log::warn!("BT: {:?}", e.backtrace());
-        } else {
-            log::info!("Sync was successful!");
-        }
+    // now the syncs.
+    // For now we never persist the global state, which means we may lose
+    // which engines are declined.
+    // That's OK for the short term, and ultimately, syncing functionality
+    // will be in places_api, which will give us this for free.
+
+    // Migrate state, which we must do before we sync *any* engine.
+    HistoryStore::migrate_v1_global_state(&conn)?;
+
+    let mut sync_ping = telemetry::SyncTelemetryPing::new();
+
+    let stores_to_sync: Vec<&dyn Store> = stores.iter().map(AsRef::as_ref).collect();
+    if let Err(e) = sync_multiple(
+        &stores_to_sync,
+        &mut global_state,
+        &mut mem_cached_state,
+        &cli_fxa.client_init.clone(),
+        &cli_fxa.root_sync_key,
+        &mut sync_ping,
+        &interruptee,
+    ) {
+        log::warn!("Sync failed! {}", e);
+        log::warn!("BT: {:?}", e.backtrace());
+    } else {
+        log::info!("Sync was successful!");
     }
     println!(
         "Sync telemetry: {}",
@@ -213,11 +264,6 @@ pub struct Opts {
     )]
     /// Path to the database, which will be created if it doesn't exist.
     pub database_path: String,
-
-    #[structopt(name = "encryption_key", long, short = "k")]
-    /// The database encryption key. If not specified the database will not
-    /// be encrypted.
-    pub encryption_key: Option<String>,
 
     /// Leaves all logging disabled, which may be useful when evaluating perf
     #[structopt(name = "no-logging", long)]
@@ -241,7 +287,11 @@ enum Command {
         #[structopt(name = "credentials", long, default_value = "./credentials.json")]
         credential_file: String,
 
-        /// Wipe the server store before syncing.
+        /// Wipe ALL storage from the server before syncing.
+        #[structopt(name = "wipe-all-remote", long)]
+        wipe_all: bool,
+
+        /// Wipe the engine data from the server before syncing.
         #[structopt(name = "wipe-remote", long)]
         wipe: bool,
 
@@ -282,16 +332,17 @@ fn main() -> Result<()> {
     }
 
     let db_path = opts.database_path;
-    let encryption_key: Option<&str> = opts.encryption_key.as_ref().map(|s| &**s);
-    let db = PlacesDb::open(db_path, encryption_key)?;
+    let api = PlacesApi::new(&db_path)?;
+    let db = api.open_connection(ConnectionType::ReadWrite)?;
 
     match opts.cmd {
         Command::Sync {
             engines,
             credential_file,
+            wipe_all,
             wipe,
             reset,
-        } => sync(&db, engines, credential_file, wipe, reset),
+        } => sync(&api, engines, credential_file, wipe_all, wipe, reset),
         Command::ExportBookmarks { output_file } => run_native_export(&db, output_file),
         Command::ImportBookmarks { input_file } => run_native_import(&db, input_file),
         Command::ImportDesktopBookmarks { input_file } => run_desktop_import(&db, input_file),

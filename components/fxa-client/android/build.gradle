@@ -5,7 +5,7 @@ apply plugin: 'kotlin-android-extensions'
 apply plugin: 'com.google.protobuf'
 
 android {
-    compileSdkVersion 27
+    compileSdkVersion rootProject.ext.build.compileSdkVersion
 
     defaultConfig {
         minSdkVersion rootProject.ext.build['minSdkVersion']
@@ -27,7 +27,9 @@ android {
     }
 
     sourceSets {
+        main.jniLibs.srcDirs += "$buildDir/nativeLibs/android"
         test.resources.srcDirs += "$buildDir/rustJniLibs/desktop"
+        test.resources.srcDirs += "$buildDir/nativeLibs/desktop"
 
         main {
             proto {
@@ -36,12 +38,8 @@ android {
         }
     }
 
-    // Help folks debugging by including symbols in our native libraries.  Yes, this makes the
-    // resulting AAR very large.  The Android ecosystem seems to be in flux around who is in charge
-    // of stripping native binaries, but for now let's provide symbols and see how consumers react.
-    packagingOptions {
-        doNotStrip "**/*.so"
-    }
+    // Uncomment to include debug symbols in native library builds.
+    // packagingOptions { doNotStrip "**/*.so" }
 }
 
 configurations {
@@ -67,22 +65,17 @@ cargo {
 
     libname = 'fxaclient_ffi'
 
-    // The Cargo targets to invoke.  The mapping from short name to target
-    // triple is defined by the `rust-android-gradle` plugin.
-    targets = [
-        'linux-x86-64',
-        'darwin',
-        'win32-x86-64-gnu',
-        'arm',
-        'arm64',
-        'x86',
-    ]
+    targets = rootProject.ext.rustTargets
 
-    // Perform release builds (which should have debug info, due to
-    // `debug = true` in Cargo.toml).
-    profile = "release"
+    profile = rootProject.ext.nonMegazordProfile
 
     exec = rootProject.ext.cargoExec
+
+    extraCargoBuildArguments = rootProject.ext.extraCargoBuildArguments
+
+    features {
+        defaultAnd("reqwest")
+    }
 }
 
 configurations {
@@ -124,10 +117,10 @@ protobuf {
 }
 
 dependencies {
-    jnaForTest 'net.java.dev.jna:jna:4.5.2@jar'
+    jnaForTest "net.java.dev.jna:jna:$jna_version@jar"
+    implementation "net.java.dev.jna:jna:$jna_version@aar"
 
     implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk7:$kotlin_version"
-    implementation 'net.java.dev.jna:jna:4.5.2@aar'
 
     implementation 'com.google.protobuf:protobuf-lite:3.0.0'
     implementation project(':as-support-library')
@@ -158,18 +151,20 @@ afterEvaluate {
         def buildType = "${variant.buildType.name.capitalize()}"
         if (variant.buildType.name != 'withoutLib') {
             tasks["generate${productFlavor}${buildType}Assets"].dependsOn(tasks["cargoBuild"])
+            tasks["generate${productFlavor}${buildType}Assets"].dependsOn(tasks["copyNativeLibs"])
         }
 
         // For unit tests.
         tasks["process${productFlavor}${buildType}UnitTestJavaRes"].dependsOn(tasks["cargoBuild"])
+        tasks["process${productFlavor}${buildType}UnitTestJavaRes"].dependsOn(tasks["copyNativeLibs"])
     }
 }
 
 apply from: "$rootDir/publish.gradle"
+// If using jnaForTestConfiguration or variantWithoutLib,
+// please also update the corresponding .buildconfig-android.yml
+// `publishedArtifacts` property.
 ext.configurePublish(
-        'org.mozilla.fxaclient',
-        'fxaclient',
-        'Firefox Accounts client.',
         /* jnaForTestConfiguration= */ configurations.jnaForTest,
         /* variantWithoutLib= */ 'androidWithoutLib',
 )

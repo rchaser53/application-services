@@ -241,6 +241,12 @@ impl<T> HandleMap<T> {
         self.num_entries
     }
 
+    /// Returns true if the HandleMap is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Returns the number of slots allocated in the handle map.
     #[inline]
     pub fn capacity(&self) -> usize {
@@ -342,10 +348,10 @@ impl<T> HandleMap<T> {
             free_indices[ni].1 = true;
 
             match &self.entries[ni].state {
-                &EntryState::InFreeList(ref next_index) => next = *next_index,
-                &EntryState::EndOfFreeList => break,
+                EntryState::InFreeList(next_index) => next = *next_index,
+                EntryState::EndOfFreeList => break,
                 // Hitting `Active` here is probably not possible because of the checks above, but who knows.
-                &EntryState::Active(..) => panic!("Bug: Active item in free list at {}", next),
+                EntryState::Active(..) => unreachable!("Bug: Active item in free list at {}", next),
             }
         }
         let mut occupied_count = 0;
@@ -565,12 +571,12 @@ impl Handle {
     /// Most uses of this will be automatic due to our [`IntoFfi`] implementation.
     #[inline]
     pub fn into_u64(self) -> u64 {
-        let map_id = self.map_id as u64;
-        let version = self.version as u64;
-        let index = self.index as u64;
+        let map_id = u64::from(self.map_id);
+        let version = u64::from(self.version);
+        let index = u64::from(self.index);
         // SOMEDAY: we could also use this as a sort of CRC if we were really paranoid.
         // e.g. `magic = combine_to_u16(map_id, version, index)`.
-        let magic = HANDLE_MAGIC as u64;
+        let magic = u64::from(HANDLE_MAGIC);
         (magic << 48) | (map_id << 32) | (index << 16) | version
     }
 
@@ -603,7 +609,7 @@ impl Handle {
     /// encoded [`Handle`].
     #[inline]
     pub fn is_valid(v: u64) -> bool {
-        (v >> 48) == (HANDLE_MAGIC as u64) &&
+        (v >> 48) == u64::from(HANDLE_MAGIC) &&
         // The "bottom" field is the version. We increment it both when
         // inserting and removing, and they're all initially 1. So, all valid
         // handles that we returned should have an even version.
@@ -880,7 +886,7 @@ impl<T> ConcurrentHandleMap<T> {
         callback: F,
     ) -> R::Value
     where
-        F: FnOnce(&mut T) -> Result<R, E>,
+        F: std::panic::UnwindSafe + FnOnce(&mut T) -> Result<R, E>,
         ExternError: From<E>,
         R: IntoFfi,
     {
@@ -904,7 +910,7 @@ impl<T> ConcurrentHandleMap<T> {
         callback: F,
     ) -> R::Value
     where
-        F: FnOnce(&T) -> Result<R, E>,
+        F: std::panic::UnwindSafe + FnOnce(&T) -> Result<R, E>,
         ExternError: From<E>,
         R: IntoFfi,
     {
@@ -919,7 +925,7 @@ impl<T> ConcurrentHandleMap<T> {
         callback: F,
     ) -> R::Value
     where
-        F: FnOnce(&T) -> R,
+        F: std::panic::UnwindSafe + FnOnce(&T) -> R,
         R: IntoFfi,
     {
         self.call_with_result(out_error, h, |r| -> Result<_, HandleError> {
@@ -935,7 +941,7 @@ impl<T> ConcurrentHandleMap<T> {
         callback: F,
     ) -> R::Value
     where
-        F: FnOnce(&mut T) -> R,
+        F: std::panic::UnwindSafe + FnOnce(&mut T) -> R,
         R: IntoFfi,
     {
         self.call_with_result_mut(out_error, h, |r| -> Result<_, HandleError> {
@@ -948,7 +954,7 @@ impl<T> ConcurrentHandleMap<T> {
     /// `ExternError`).
     pub fn insert_with_result<E, F>(&self, out_error: &mut ExternError, constructor: F) -> u64
     where
-        F: FnOnce() -> Result<T, E>,
+        F: std::panic::UnwindSafe + FnOnce() -> Result<T, E>,
         ExternError: From<E>,
     {
         use crate::call_with_result;
@@ -969,12 +975,19 @@ impl<T> ConcurrentHandleMap<T> {
     /// clear that it contains a [`call_with_output`] internally.
     pub fn insert_with_output<F>(&self, out_error: &mut ExternError, constructor: F) -> u64
     where
-        F: FnOnce() -> T,
+        F: std::panic::UnwindSafe + FnOnce() -> T,
     {
         // The Err type isn't important here beyond being convertable to ExternError
         self.insert_with_result(out_error, || -> Result<_, HandleError> {
             Ok(constructor())
         })
+    }
+}
+
+impl<T> Default for ConcurrentHandleMap<T> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1014,12 +1027,12 @@ mod test {
         assert_eq!(Handle::from_u64(0), Err(HandleError::NullHandle));
         // Valid except `version` is odd
         assert_eq!(
-            Handle::from_u64(((HANDLE_MAGIC as u64) << 48) | 0x1234_0012_0001),
+            Handle::from_u64((u64::from(HANDLE_MAGIC) << 48) | 0x1234_0012_0001),
             Err(HandleError::InvalidHandle)
         );
 
         assert_eq!(
-            Handle::from_u64(((HANDLE_MAGIC as u64) << 48) | 0x1234_0012_0002),
+            Handle::from_u64((u64::from(HANDLE_MAGIC) << 48) | 0x1234_0012_0002),
             Ok(Handle {
                 version: 0x0002,
                 index: 0x0012,

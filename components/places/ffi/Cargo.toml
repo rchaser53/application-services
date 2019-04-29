@@ -3,28 +3,33 @@ name = "places-ffi"
 edition = "2018"
 version = "0.1.0"
 authors = ["Thom Chiovoloni <tchiovoloni@mozilla.com>"]
+license = "MPL-2.0"
 
 [lib]
 name = "places_ffi"
 crate-type = ["lib", "staticlib", "cdylib"]
+
+[features]
+reqwest = ["viaduct/reqwest", "places/reqwest"]
+default = []
 
 [dependencies]
 serde_json = "1.0.28"
 log = "0.4"
 url = "1.7.1"
 ffi-support = { path = "../../support/ffi" }
-lazy_static = "1.2.0"
-
-[dependencies.rusqlite]
-version = "0.16.0"
-features = ["sqlcipher", "limits", "functions"]
+lazy_static = "1.3.0"
+prost = "0.5.0"
+bytes = "0.4.12"
+viaduct = { path = "../../viaduct" }
+interrupt = { path = "../../support/interrupt" }
+sql-support = { path = "../../support/sql" }
 
 [dependencies.sync15]
 path = "../../sync15"
 
 [dependencies.places]
 path = ".."
-features = ["ffi"]
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.7.0"

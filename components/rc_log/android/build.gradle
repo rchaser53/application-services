@@ -4,7 +4,7 @@ apply plugin: 'kotlin-android'
 apply plugin: 'kotlin-android-extensions'
 
 android {
-    compileSdkVersion 27
+    compileSdkVersion rootProject.ext.build.compileSdkVersion
 
     defaultConfig {
         minSdkVersion rootProject.ext.build['minSdkVersion']
@@ -29,12 +29,8 @@ android {
         test.resources.srcDirs += "$buildDir/rustJniLibs/desktop"
     }
 
-    // Help folks debugging by including symbols in our native libraries.  Yes, this makes the
-    // resulting AAR very large.  The Android ecosystem seems to be in flux around who is in charge
-    // of stripping native binaries, but for now let's provide symbols and see how consumers react.
-    packagingOptions {
-        doNotStrip "**/*.so"
-    }
+    // Uncomment to include debug symbols in native library builds.
+    // packagingOptions { doNotStrip "**/*.so" }
 }
 
 configurations {
@@ -60,22 +56,13 @@ cargo {
 
     libname = 'rc_log_ffi'
 
-    // The Cargo targets to invoke.  The mapping from short name to target
-    // triple is defined by the `rust-android-gradle` plugin.
-    targets = [
-        'linux-x86-64',
-        'darwin',
-        'win32-x86-64-gnu',
-        'arm',
-        'arm64',
-        'x86',
-    ]
+    targets = rootProject.ext.rustTargets
 
-    // Perform release builds (which should have debug info, due to
-    // `debug = true` in Cargo.toml).
-    profile = "release"
+    profile = rootProject.ext.nonMegazordProfile
 
     exec = rootProject.ext.cargoExec
+
+    extraCargoBuildArguments = rootProject.ext.extraCargoBuildArguments
 
     features {
         defaultAnd("force_android")
@@ -100,10 +87,10 @@ configurations {
 }
 
 dependencies {
-    jnaForTest 'net.java.dev.jna:jna:4.5.2@jar'
+    jnaForTest "net.java.dev.jna:jna:$jna_version@jar"
+    implementation "net.java.dev.jna:jna:$jna_version@aar"
 
     implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk7:$kotlin_version"
-    implementation 'net.java.dev.jna:jna:4.5.2@aar'
 
     // For reasons unknown, resolving the jnaForTest configuration directly
     // trips a nasty issue with the Android-Gradle plugin 3.2.1, like `Cannot
@@ -137,10 +124,10 @@ afterEvaluate {
 }
 
 apply from: "$rootDir/publish.gradle"
+// If using jnaForTestConfiguration or variantWithoutLib,
+// please also update the corresponding .buildconfig-android.yml
+// `publishedArtifacts` property.
 ext.configurePublish(
-        'org.mozilla.appservices',
-        'rustlog',
-        'Android hook into the log crate',
         /* jnaForTestConfiguration= */ configurations.jnaForTest,
         /* variantWithoutLib= */ 'androidWithoutLib',
 )

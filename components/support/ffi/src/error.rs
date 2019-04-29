@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-use crate::string::{destroy_c_string, rust_str_from_c, rust_string_to_c};
+use crate::string::{destroy_c_string, rust_string_to_c};
 use std::os::raw::c_char;
 use std::{self, ptr};
 
@@ -133,6 +133,7 @@ pub struct ExternError {
 }
 
 impl std::panic::UnwindSafe for ExternError {}
+impl std::panic::RefUnwindSafe for ExternError {}
 
 /// This is sound so long as our fields are private.
 unsafe impl Send for ExternError {}
@@ -160,6 +161,29 @@ impl ExternError {
         }
     }
 
+    /// Helper for the case where we aren't exposing this back over the FFI and
+    /// we just want to warn if an error occurred and then release the allocated
+    /// memory.
+    ///
+    /// Typically, this is done if the error will still be detected and reported
+    /// by other channels.
+    ///
+    /// We assume we're not inside a catch_unwind, and so we wrap inside one
+    /// ourselves.
+    pub fn consume_and_log_if_error(self) {
+        if !self.code.is_success() {
+            // in practice this should never panic, but you never know...
+            crate::abort_on_panic::call_with_output(|| {
+                log::error!("Unhandled ExternError({:?}) {:?}", self.code, unsafe {
+                    crate::FfiStr::from_raw(self.message)
+                });
+                unsafe {
+                    self.manually_release();
+                }
+            })
+        }
+    }
+
     /// Get the `code` property.
     #[inline]
     pub fn get_code(&self) -> ErrorCode {
@@ -170,17 +194,6 @@ impl ExternError {
     #[inline]
     pub fn get_raw_message(&self) -> *const c_char {
         self.message as *const _
-    }
-
-    /// Get the `message` property as something usable from rust. Unsafe because it reads from a raw
-    /// pointer.
-    #[inline]
-    pub unsafe fn get_message(&self) -> Option<&str> {
-        if self.message.is_null() {
-            None
-        } else {
-            Some(rust_str_from_c(self.message))
-        }
     }
 
     /// Manually release the memory behind this string. You probably don't want to call this.
@@ -205,8 +218,8 @@ impl Default for ExternError {
 
 // This is the `Err` of std::thread::Result, which is what
 // `panic::catch_unwind` returns.
-impl From<Box<std::any::Any + Send + 'static>> for ExternError {
-    fn from(e: Box<std::any::Any + Send + 'static>) -> Self {
+impl From<Box<dyn std::any::Any + Send + 'static>> for ExternError {
+    fn from(e: Box<dyn std::any::Any + Send + 'static>) -> Self {
         // The documentation suggests that it will *usually* be a str or String.
         let message = if let Some(s) = e.downcast_ref::<&'static str>() {
             s.to_string()
@@ -266,7 +279,7 @@ impl ErrorCode {
 
     /// Returns whether or not this is a success code.
     #[inline]
-    pub fn is_success(&self) -> bool {
+    pub fn is_success(self) -> bool {
         self.code() == 0
     }
 }

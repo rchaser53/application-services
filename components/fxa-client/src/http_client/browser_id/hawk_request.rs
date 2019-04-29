@@ -4,24 +4,21 @@
 
 use crate::errors::*;
 use hawk::{Credentials, Key, PayloadHasher, RequestBuilder, SHA256};
-use reqwest::{
-    header::{self, HeaderValue},
-    Client, Method, Request,
-};
 use url::Url;
+use viaduct::{header_names, Method, Request};
 
 const KEY_LENGTH: usize = 32;
 
-pub struct HAWKRequestBuilder<'a> {
+pub struct HawkRequestBuilder<'a> {
     url: Url,
     method: Method,
     body: Option<String>,
-    hkdf_sha256_key: &'a Vec<u8>,
+    hkdf_sha256_key: &'a [u8],
 }
 
-impl<'a> HAWKRequestBuilder<'a> {
-    pub fn new(method: Method, url: Url, hkdf_sha256_key: &'a Vec<u8>) -> Self {
-        HAWKRequestBuilder {
+impl<'a> HawkRequestBuilder<'a> {
+    pub fn new(method: Method, url: Url, hkdf_sha256_key: &'a [u8]) -> Self {
+        HawkRequestBuilder {
             url,
             method,
             body: None,
@@ -36,7 +33,7 @@ impl<'a> HAWKRequestBuilder<'a> {
         self
     }
 
-    fn make_hawk_header(&self) -> Result<HeaderValue> {
+    fn make_hawk_header(&self) -> Result<String> {
         // Make sure we de-allocate the hash after hawk_request_builder.
         let hash;
         let method = format!("{}", self.method);
@@ -53,18 +50,18 @@ impl<'a> HAWKRequestBuilder<'a> {
             key: Key::new(hmac_key, &SHA256),
         };
         let header = hawk_request.make_header(&hawk_credentials)?;
-        Ok(HeaderValue::from_str(&format!("Hawk {}", header))?)
+        Ok(format!("Hawk {}", header))
     }
 
     pub fn build(self) -> Result<Request> {
         let hawk_header = self.make_hawk_header()?;
-        let mut request_builder = Client::new()
-            .request(self.method, self.url)
-            .header(header::AUTHORIZATION, hawk_header);
+        let mut request =
+            Request::new(self.method, self.url).header(header_names::AUTHORIZATION, hawk_header)?;
         if let Some(body) = self.body {
-            request_builder = request_builder.header(header::CONTENT_TYPE, "application/json");
-            request_builder = request_builder.body(body);
+            request = request
+                .header(header_names::CONTENT_TYPE, "application/json")?
+                .body(body);
         }
-        Ok(request_builder.build()?)
+        Ok(request)
     }
 }

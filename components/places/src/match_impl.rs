@@ -36,7 +36,7 @@ pub enum MatchBehavior {
 
 impl FromSql for MatchBehavior {
     #[inline]
-    fn column_result(value: ValueRef) -> FromSqlResult<Self> {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
         Ok(match value.as_i64()? {
             0 => MatchBehavior::Anywhere,
             1 => MatchBehavior::BoundaryAnywhere,
@@ -51,7 +51,7 @@ impl FromSql for MatchBehavior {
 
 impl ToSql for MatchBehavior {
     #[inline]
-    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput> {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
         Ok(ToSqlOutput::from(*self as u32))
     }
 }
@@ -59,7 +59,7 @@ impl ToSql for MatchBehavior {
 bitflags! {
     pub struct SearchBehavior: u32 {
         /// Search through history.
-        const HISTORY = 1 << 0;
+        const HISTORY = 1;
 
         /// Search through bookmarks.
         const BOOKMARK = 1 << 1;
@@ -111,7 +111,7 @@ impl SearchBehavior {
 
 impl FromSql for SearchBehavior {
     #[inline]
-    fn column_result(value: ValueRef) -> FromSqlResult<Self> {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
         SearchBehavior::from_bits(u32::column_result(value)?)
             .ok_or_else(|| FromSqlError::InvalidType)
     }
@@ -119,7 +119,7 @@ impl FromSql for SearchBehavior {
 
 impl ToSql for SearchBehavior {
     #[inline]
-    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput> {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
         Ok(ToSqlOutput::from(self.bits()))
     }
 }
@@ -257,13 +257,16 @@ fn next_codepoint_lower(s: &str) -> (char, usize) {
     // this should be more efficient than this implementation is)
     let mut indices = s.char_indices();
     let (_, next_char) = indices.next().unwrap();
-    let next_index = indices.next().map(|(index, _)| index).unwrap_or(s.len());
+    let next_index = indices
+        .next()
+        .map(|(index, _)| index)
+        .unwrap_or_else(|| s.len());
     (char_to_lower_single(next_char), next_index)
 }
 
 // Port of places `findInString`.
 pub fn find_in_string(token: &str, src: &str, only_boundary: bool) -> bool {
-    // Place's verison has this restriction too
+    // Place's version has this restriction too
     assert!(!token.is_empty(), "Don't search for an empty string");
     if src.len() < token.len() {
         return false;
@@ -300,20 +303,7 @@ pub fn find_in_string(token: &str, src: &str, only_boundary: bool) -> bool {
         }
         cur_offset += next_offset_in_cur;
     }
-    return false;
-}
-
-// Places splits on ascii whitespace, so we do too. str::split_ascii_whitespace is
-// currently not stable, so we use this, which is the same thing and based on it's source.
-#[inline]
-fn ascii_words<'a>(text: &'a str) -> impl Iterator<Item = &'a str> + 'a {
-    use std::str;
-    text.as_bytes()
-        .split(|c| c.is_ascii_whitespace())
-        .filter(|s| !s.is_empty())
-        // This is safe because there's no way to remove ascii text from a
-        // utf-8 string that makes it invalid utf-8 (and that's all we've done).
-        .map(|s| unsafe { str::from_utf8_unchecked(s) })
+    false
 }
 
 // Search functions used as function pointers by AutocompleteMatch::Invoke
@@ -422,7 +412,7 @@ impl<'search, 'url, 'title, 'tags> AutocompleteMatch<'search, 'url, 'title, 'tag
 
         let trimmed_url = util::slice_up_to(fixed_url.as_ref(), MAX_CHARS_TO_SEARCH_THROUGH);
         let trimmed_title = util::slice_up_to(self.title_str, MAX_CHARS_TO_SEARCH_THROUGH);
-        for token in ascii_words(self.search_str) {
+        for token in self.search_str.split_ascii_whitespace() {
             let matches = match (
                 self.has_behavior(SearchBehavior::TITLE),
                 self.has_behavior(SearchBehavior::URL),
@@ -476,40 +466,34 @@ mod test {
         //
         // It also checks that U+0130 is the only single codepoint that lower cases
         // to multiple characters.
-        for c in 128..0x110000 {
-            match char::from_u32(c) {
-                Some(ch) => {
-                    // Not quite the same (because codepoints aren't characters), but
-                    // should serve the same purpose.
-                    let mut li = ch.to_lowercase();
-                    let lc = li.next().unwrap();
-                    if c != 304 && c != 8490 {
-                        assert!(
-                            (lc as u32) >= 128,
-                            "Lower case of non-ascii '{}' ({}) was unexpectedly ascii",
-                            ch,
-                            c
-                        );
-                        // This one we added (it's an implicit assumption in the utilities the
-                        // places code uses).
-                        assert!(
-                            li.next().is_none(),
-                            "Lower case of '{}' ({}) produced multiple codepoints unexpectedly",
-                            ch,
-                            c
-                        );
-                    } else {
-                        assert!(
-                            (lc as u32) < 128,
-                            "Lower case of non-ascii '{}' ({}) was unexpectedly not ascii",
-                            ch,
-                            c
-                        );
-                    }
-                }
-                _ => {
-                    // We're being overly broad with what `c` iterates over to keep this fairly
-                    // simple.
+        for c in 128..0x11_0000 {
+            if let Some(ch) = char::from_u32(c) {
+                // Not quite the same (because codepoints aren't characters), but
+                // should serve the same purpose.
+                let mut li = ch.to_lowercase();
+                let lc = li.next().unwrap();
+                if c != 304 && c != 8490 {
+                    assert!(
+                        (lc as u32) >= 128,
+                        "Lower case of non-ascii '{}' ({}) was unexpectedly ascii",
+                        ch,
+                        c
+                    );
+                    // This one we added (it's an implicit assumption in the utilities the
+                    // places code uses).
+                    assert!(
+                        li.next().is_none(),
+                        "Lower case of '{}' ({}) produced multiple codepoints unexpectedly",
+                        ch,
+                        c
+                    );
+                } else {
+                    assert!(
+                        (lc as u32) < 128,
+                        "Lower case of non-ascii '{}' ({}) was unexpectedly not ascii",
+                        ch,
+                        c
+                    );
                 }
             }
         }
@@ -527,7 +511,7 @@ mod test {
             );
         }
 
-        for c in (b'a'..=b'z').into_iter().chain(b'A'..=b'Z') {
+        for c in (b'a'..=b'z').chain(b'A'..=b'Z') {
             assert_eq!(
                 dubious_to_ascii_lower(c),
                 c.to_ascii_lowercase(),

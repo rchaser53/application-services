@@ -5,15 +5,13 @@
 use crate::bso_record::EncryptedBso;
 use crate::error::{self, ErrorKind, Result};
 use crate::util::ServerTimestamp;
-use hyper::StatusCode;
-use reqwest::Response;
 use serde_derive::*;
 use std::collections::HashMap;
 use std::default::Default;
 use std::fmt;
 use std::ops::Deref;
-use std::str::FromStr;
 use url::{form_urlencoded::Serializer, Url, UrlQuery};
+use viaduct::{header_names, status_codes, Response};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum RequestOrder {
@@ -22,16 +20,13 @@ pub enum RequestOrder {
     Index,
 }
 
-pub const X_IF_UNMODIFIED_SINCE: &str = "X-If-Unmodified-Since";
-const X_LAST_MODIFIED: &str = "X-Last-Modified";
-
 impl fmt::Display for RequestOrder {
     #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            &RequestOrder::Oldest => f.write_str("oldest"),
-            &RequestOrder::Newest => f.write_str("newest"),
-            &RequestOrder::Index => f.write_str("index"),
+            RequestOrder::Oldest => f.write_str("oldest"),
+            RequestOrder::Newest => f.write_str("newest"),
+            RequestOrder::Index => f.write_str("index"),
         }
     }
 }
@@ -119,17 +114,17 @@ impl CollectionRequest {
         self
     }
 
-    fn build_query(&self, pairs: &mut Serializer<UrlQuery>) {
+    fn build_query(&self, pairs: &mut Serializer<UrlQuery<'_>>) {
         if self.full {
             pairs.append_pair("full", "1");
         }
         if self.limit > 0 {
             pairs.append_pair("limit", &format!("{}", self.limit));
         }
-        if let &Some(ref ids) = &self.ids {
+        if let Some(ids) = &self.ids {
             pairs.append_pair("ids", &ids.join(","));
         }
-        if let &Some(ref batch) = &self.batch {
+        if let Some(batch) = &self.batch {
             pairs.append_pair("batch", &batch);
         }
         if self.commit {
@@ -192,7 +187,7 @@ impl LimitTracker {
     pub fn can_add_record(&self, payload_size: usize) -> bool {
         // Desktop does the cur_bytes check as exclusive, but we shouldn't see any servers that
         // don't have https://github.com/mozilla-services/server-syncstorage/issues/73
-        self.cur_records + 1 <= self.max_records && self.cur_bytes + payload_size <= self.max_bytes
+        self.cur_records < self.max_records && self.cur_bytes + payload_size <= self.max_bytes
     }
 
     pub fn can_never_add(&self, record_size: usize) -> bool {
@@ -293,22 +288,23 @@ pub struct UploadResult {
 // Easier to fake during tests
 #[derive(Debug, Clone)]
 pub struct PostResponse {
-    pub status: StatusCode,
+    pub status: u16,
     pub result: UploadResult, // This is lazy...
     pub last_modified: ServerTimestamp,
 }
 
 impl PostResponse {
-    pub fn from_response(r: &mut Response) -> Result<PostResponse> {
+    pub fn is_success(&self) -> bool {
+        status_codes::is_success_code(self.status)
+    }
+    pub fn from_response(r: &Response) -> Result<PostResponse> {
         let result: UploadResult = r.json()?;
         // TODO Can this happen in error cases?
         let last_modified = r
-            .headers()
-            .get(X_LAST_MODIFIED)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| ServerTimestamp::from_str(s).ok())
+            .headers
+            .try_get::<ServerTimestamp, _>(header_names::X_LAST_MODIFIED)
             .ok_or_else(|| ErrorKind::MissingServerTimestamp)?;
-        let status = r.status();
+        let status = r.status;
         Ok(PostResponse {
             status,
             result,
@@ -342,7 +338,7 @@ pub trait BatchPoster {
     /// Important: Poster should not report non-success HTTP statuses as errors!!
     fn post<P, O>(
         &self,
-        body: &[u8],
+        body: Vec<u8>,
         xius: ServerTimestamp,
         batch: Option<String>,
         commit: bool,
@@ -380,19 +376,19 @@ impl NormalResponseHandler {
 
 impl PostResponseHandler for NormalResponseHandler {
     fn handle_response(&mut self, r: PostResponse, mid_batch: bool) -> error::Result<()> {
-        if !r.status.is_success() {
+        if !r.is_success() {
             log::warn!("Got failure status from server while posting: {}", r.status);
-            if r.status == StatusCode::PRECONDITION_FAILED {
+            if r.status == status_codes::PRECONDITION_FAILED {
                 return Err(ErrorKind::BatchInterrupted.into());
             } else {
                 return Err(ErrorKind::StorageHttpError {
-                    code: r.status.as_u16(),
+                    code: r.status,
                     route: "collection storage (TODO: record route somewhere)".into(),
                 }
                 .into());
             }
         }
-        if r.result.failed.len() > 0 && !self.allow_failed {
+        if !r.result.failed.is_empty() && !self.allow_failed {
             return Err(ErrorKind::RecordUploadFailed.into());
         }
         for id in r.result.success.iter() {
@@ -436,7 +432,7 @@ where
     #[inline]
     fn in_batch(&self) -> bool {
         match &self.batch {
-            &BatchState::Unsupported | &BatchState::NoBatch => false,
+            BatchState::Unsupported | BatchState::NoBatch => false,
             _ => true,
         }
     }
@@ -520,7 +516,7 @@ where
     }
 
     pub fn flush(&mut self, want_commit: bool) -> Result<()> {
-        if self.queued.len() == 0 {
+        if self.queued.is_empty() {
             assert!(
                 !self.in_batch(),
                 "Bug: Somehow we're in a batch but have no queued records"
@@ -532,11 +528,11 @@ where
         self.queued.push(b']');
         let batch_id = match &self.batch {
             // Not the first post and we know we have no batch semantics.
-            &BatchState::Unsupported => None,
+            BatchState::Unsupported => None,
             // First commit in possible batch
-            &BatchState::NoBatch => Some("true".into()),
+            BatchState::NoBatch => Some("true".into()),
             // In a batch and we have a batch id.
-            &BatchState::InBatch(ref s) => Some(s.clone()),
+            BatchState::InBatch(ref s) => Some(s.clone()),
         };
 
         log::info!(
@@ -545,11 +541,15 @@ where
             self.queued.len()
         );
 
-        let is_commit = want_commit && !batch_id.is_none();
+        let is_commit = want_commit && batch_id.is_some();
         // Weird syntax for calling a function object that is a property.
-        let resp_or_error =
-            self.poster
-                .post(&self.queued, self.last_modified, batch_id, is_commit, self);
+        let resp_or_error = self.poster.post(
+            self.queued.clone(),
+            self.last_modified,
+            batch_id,
+            is_commit,
+            self,
+        );
 
         self.queued.truncate(0);
 
@@ -560,8 +560,8 @@ where
 
         let resp = resp_or_error?;
 
-        if !resp.status.is_success() {
-            let code = resp.status.as_u16();
+        if !resp.is_success() {
+            let code = resp.status;
             self.on_response.handle_response(resp, !want_commit)?;
             log::error!("Bug: expected OnResponse to have bailed out!");
             // Should we assert here instead?
@@ -583,7 +583,7 @@ where
             return Ok(());
         }
 
-        if resp.status != StatusCode::ACCEPTED {
+        if resp.status != status_codes::ACCEPTED {
             if self.in_batch() {
                 return Err(ErrorKind::ServerBatchProblem(
                     "Server responded non-202 success code while a batch was in progress",
@@ -607,11 +607,11 @@ where
             .clone();
 
         match &self.batch {
-            &BatchState::Unsupported => {
+            BatchState::Unsupported => {
                 log::warn!("Server changed it's mind about supporting batching mid-batch...");
             }
 
-            &BatchState::InBatch(ref cur_id) => {
+            BatchState::InBatch(ref cur_id) => {
                 if cur_id != &batch_id {
                     return Err(ErrorKind::ServerBatchProblem(
                         "Invalid server response: 202 without a batch ID",
@@ -872,13 +872,13 @@ mod test {
     impl BatchPoster for TestPosterRef {
         fn post<T, O>(
             &self,
-            body: &[u8],
+            body: Vec<u8>,
             xius: ServerTimestamp,
             batch: Option<String>,
             commit: bool,
             queue: &PostQueue<T, O>,
         ) -> Result<PostResponse> {
-            self.borrow_mut().do_post(body, xius, batch, commit, queue)
+            self.borrow_mut().do_post(&body, xius, batch, commit, queue)
         }
     }
 
@@ -900,16 +900,12 @@ mod test {
         (pq, tester)
     }
 
-    fn fake_response<'a, T: Into<Option<&'a str>>>(
-        status: StatusCode,
-        lm: f64,
-        batch: T,
-    ) -> PostResponse {
+    fn fake_response<'a, T: Into<Option<&'a str>>>(status: u16, lm: f64, batch: T) -> PostResponse {
         PostResponse {
             status,
             last_modified: ServerTimestamp(lm),
             result: UploadResult {
-                batch: batch.into().map(|x| x.into()),
+                batch: batch.into().map(Into::into),
                 failed: HashMap::new(),
                 success: vec![],
             },
@@ -983,11 +979,11 @@ mod test {
             max_record_payload_bytes: 1000,
             ..InfoConfiguration::default()
         };
-        let time = 11111111.0;
+        let time = 11_111_111.0;
         let (mut pq, tester) = pq_test_setup(
             cfg,
             time,
-            vec![fake_response(StatusCode::OK, time + 100.0, None)],
+            vec![fake_response(status_codes::OK, time + 100.0, None)],
         );
 
         pq.enqueue(&make_record(100)).unwrap();
@@ -1012,13 +1008,13 @@ mod test {
             max_request_bytes: 250,
             ..InfoConfiguration::default()
         };
-        let time = 11111111.0;
+        let time = 11_111_111.0;
         let (mut pq, tester) = pq_test_setup(
             cfg,
             time,
             vec![
-                fake_response(StatusCode::OK, time + 100.0, None),
-                fake_response(StatusCode::OK, time + 200.0, None),
+                fake_response(status_codes::OK, time + 100.0, None),
+                fake_response(status_codes::OK, time + 200.0, None),
             ],
         );
 
@@ -1061,13 +1057,13 @@ mod test {
             max_request_bytes: 350,
             ..InfoConfiguration::default()
         };
-        let time = 11111111.0;
+        let time = 11_111_111.0;
         let (mut pq, tester) = pq_test_setup(
             cfg,
             time,
             vec![
-                fake_response(StatusCode::OK, time + 100.0, None),
-                fake_response(StatusCode::OK, time + 200.0, None),
+                fake_response(status_codes::OK, time + 100.0, None),
+                fake_response(status_codes::OK, time + 200.0, None),
             ],
         );
 
@@ -1095,12 +1091,12 @@ mod test {
     #[test]
     fn test_pq_single_batch() {
         let cfg = InfoConfiguration::default();
-        let time = 11111111.0;
+        let time = 11_111_111.0;
         let (mut pq, tester) = pq_test_setup(
             cfg,
             time,
             vec![fake_response(
-                StatusCode::ACCEPTED,
+                status_codes::ACCEPTED,
                 time + 100.0,
                 Some("1234"),
             )],
@@ -1133,13 +1129,13 @@ mod test {
             max_post_bytes: 200,
             ..InfoConfiguration::default()
         };
-        let time = 11111111.0;
+        let time = 11_111_111.0;
         let (mut pq, tester) = pq_test_setup(
             cfg,
             time,
             vec![
-                fake_response(StatusCode::ACCEPTED, time, Some("1234")),
-                fake_response(StatusCode::ACCEPTED, time + 100.0, Some("1234")),
+                fake_response(status_codes::ACCEPTED, time, Some("1234")),
+                fake_response(status_codes::ACCEPTED, time + 100.0, Some("1234")),
             ],
         );
 
@@ -1182,14 +1178,14 @@ mod test {
             max_post_records: 3,
             ..InfoConfiguration::default()
         };
-        let time = 11111111.0;
+        let time = 11_111_111.0;
         let (mut pq, tester) = pq_test_setup(
             cfg,
             time,
             vec![
-                fake_response(StatusCode::ACCEPTED, time, Some("1234")),
-                fake_response(StatusCode::ACCEPTED, time, Some("1234")),
-                fake_response(StatusCode::ACCEPTED, time + 100.0, Some("1234")),
+                fake_response(status_codes::ACCEPTED, time, Some("1234")),
+                fake_response(status_codes::ACCEPTED, time, Some("1234")),
+                fake_response(status_codes::ACCEPTED, time + 100.0, Some("1234")),
             ],
         );
 
@@ -1241,21 +1237,22 @@ mod test {
     }
 
     #[test]
+    #[allow(clippy::cyclomatic_complexity)]
     fn test_pq_multi_post_multi_batch_records() {
         let cfg = InfoConfiguration {
             max_post_records: 3,
             max_total_records: 5,
             ..InfoConfiguration::default()
         };
-        let time = 11111111.0;
+        let time = 11_111_111.0;
         let (mut pq, tester) = pq_test_setup(
             cfg,
             time,
             vec![
-                fake_response(StatusCode::ACCEPTED, time, Some("1234")),
-                fake_response(StatusCode::ACCEPTED, time + 100.0, Some("1234")),
-                fake_response(StatusCode::ACCEPTED, time + 100.0, Some("abcd")),
-                fake_response(StatusCode::ACCEPTED, time + 200.0, Some("abcd")),
+                fake_response(status_codes::ACCEPTED, time, Some("1234")),
+                fake_response(status_codes::ACCEPTED, time + 100.0, Some("1234")),
+                fake_response(status_codes::ACCEPTED, time + 100.0, Some("abcd")),
+                fake_response(status_codes::ACCEPTED, time + 200.0, Some("abcd")),
             ],
         );
 
@@ -1323,44 +1320,58 @@ mod test {
         );
     }
 
+    macro_rules! assert_feq {
+        ($a:expr, $b:expr) => {
+            let a = $a;
+            let b = $b;
+            assert!(
+                (a - b).abs() < std::f64::EPSILON,
+                "assert_feq failure: {} != {}",
+                a,
+                b
+            )
+        };
+    }
+
     #[test]
+    #[allow(clippy::cyclomatic_complexity)]
     fn test_pq_multi_post_multi_batch_bytes() {
         let cfg = InfoConfiguration {
             max_post_bytes: 300,
             max_total_bytes: 500,
             ..InfoConfiguration::default()
         };
-        let time = 11111111.0;
+        let time = 11_111_111.0;
         let (mut pq, tester) = pq_test_setup(
             cfg,
             time,
             vec![
-                fake_response(StatusCode::ACCEPTED, time, Some("1234")),
-                fake_response(StatusCode::ACCEPTED, time + 100.0, Some("1234")), // should commit
-                fake_response(StatusCode::ACCEPTED, time + 100.0, Some("abcd")),
-                fake_response(StatusCode::ACCEPTED, time + 200.0, Some("abcd")), // should commit
+                fake_response(status_codes::ACCEPTED, time, Some("1234")),
+                fake_response(status_codes::ACCEPTED, time + 100.0, Some("1234")), // should commit
+                fake_response(status_codes::ACCEPTED, time + 100.0, Some("abcd")),
+                fake_response(status_codes::ACCEPTED, time + 200.0, Some("abcd")), // should commit
             ],
         );
 
         pq.enqueue(&make_record(100)).unwrap();
         pq.enqueue(&make_record(100)).unwrap();
         pq.enqueue(&make_record(100)).unwrap();
-        assert_eq!(pq.last_modified.0, time);
+        assert_feq!(pq.last_modified.0, time);
         // POST
         pq.enqueue(&make_record(100)).unwrap();
         pq.enqueue(&make_record(100)).unwrap();
         // POST + COMMIT
         pq.enqueue(&make_record(100)).unwrap();
-        assert_eq!(pq.last_modified.0, time + 100.0);
+        assert_feq!(pq.last_modified.0, time + 100.0);
         pq.enqueue(&make_record(100)).unwrap();
         pq.enqueue(&make_record(100)).unwrap();
 
         // POST
         pq.enqueue(&make_record(100)).unwrap();
-        assert_eq!(pq.last_modified.0, time + 100.0);
+        assert_feq!(pq.last_modified.0, time + 100.0);
         pq.flush(true).unwrap(); // COMMIT
 
-        assert_eq!(pq.last_modified.0, time + 200.0);
+        assert_feq!(pq.last_modified.0, time + 200.0);
 
         let t = tester.borrow();
         assert!(t.cur_batch.is_none());

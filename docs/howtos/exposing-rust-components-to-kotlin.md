@@ -121,4 +121,47 @@ own experience. It’s vastly simpler and less painful this way.
 
 ### Why are we using JNA rather than JNI, and what tradeoffs does that involve?
 
-Great question! We should write or link to an answer here.
+We get a couple things from using JNA that we wouldn't with JNI.
+
+1. We are able to write a *single* FFI crate. If we used JNI we'd need to write
+   one FFI that android calls, and one that iOS calls.
+
+2. JNA provides a mapping of threads to callbacks for us, making callbacks over
+   the FFI possible. That said, in practice this is still error prone, and easy
+   to misuse/cause memory safety bugs, but it's required for cases like logging,
+   among others, and so it is a nontrivial piece of complexity we'd have to
+   reimplement.
+
+However, it comes with the following downsides:
+
+1. JNA has bugs. In particular, its not safe to use bools with them, it thinks
+   they are 32 bits, when on most platforms (every platform Rust supports) they
+   are 8 bits. They've been unwilling to fix the issue due to it breaking
+   backwards compatibility (which is... somewhat fair, there is a lot of C89
+   code out there that uses `bool` as a typedef for a 32-bit `int`).
+2. JNA makes it really easy to do the wrong thing and have it work but corrupt
+   memory. Several of the caveats around this are documented in the
+   [`ffi_support` docs](https://docs.rs/ffi-support/*/ffi_support/), but a
+   major one is when to use `Pointer` vs `String` (getting this wrong will
+   often work, but may corrupt memory).
+
+### How do I debug Rust code with the step-debugger in Android Studio
+
+1. Uncomment the `packagingOptions { doNotStrip "**/*.so" }` line from the
+   build.gradle file of the component you want to debug.
+2. In the rust code, either:
+    1. Cause something to crash where you want the breakpoint. Note: Panics
+        don't work here, unfortunately. (I have not found a convenient way to
+        set a breakpoint to rust code, so
+        `unsafe { std::ptr::write_volatile(0 as *const _, 1u8) }` usually is
+        what I do).
+    2. If you manage to get an LLDB prompt, you can set a breakpoint using
+       `breakpoint set --name foo`, or `breakpoint set --file foo.rs --line 123`.
+       I don't know how to bring up this prompt reliably, so I often do step 1 to
+       get it to appear, delete the crashing code, and then set the
+       breakpoint using the CLI. This is admittedly suboptimal.
+3. Click the Debug button in Android Studio, to display the "Select Deployment
+   Target" window.
+4. Make sure the debugger selection is set to "Both". This tends to unset
+   itself, so make sure.
+5. Click "Run", and debug away.

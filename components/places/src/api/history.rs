@@ -57,11 +57,12 @@ pub fn insert(conn: &mut PlacesDb, place: AddablePlaceInfo) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::places_api::test::new_mem_connection;
     use rusqlite::NO_PARAMS;
 
     #[test]
     fn test_insert() {
-        let mut c = PlacesDb::open_in_memory(None).expect("should get a connection");
+        let mut c = new_mem_connection();
         let url = Url::parse("http://example.com").expect("it's a valid url");
         let date = Timestamp::now();
         let visits = vec![AddableVisit {
@@ -96,18 +97,14 @@ mod tests {
         let row = result.expect("expect anything");
 
         assert_eq!(
-            row.get_checked::<_, String>("url").expect("should work"),
+            row.get::<_, String>("url").expect("should work"),
             "http://example.com/"
         ); // hrmph - note trailing slash
         assert_eq!(
-            row.get_checked::<_, Timestamp>("visit_date")
-                .expect("should work"),
+            row.get::<_, Timestamp>("visit_date").expect("should work"),
             date
         );
-        assert_ne!(
-            row.get_checked::<_, i32>("frecency").expect("should work"),
-            0
-        );
+        assert_ne!(row.get::<_, i32>("frecency").expect("should work"), 0);
         // XXX - check more.
     }
 }

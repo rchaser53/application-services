@@ -2,12 +2,18 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+#![allow(unknown_lints)]
+#![warn(rust_2018_idioms)]
+// Let's allow these in the FFI code, since it's usually just a coincidence if
+// the closure is small.
+#![allow(clippy::redundant_closure)]
 use ffi_support::{
-    define_bytebuffer_destructor, define_handle_map_deleter, define_string_destructor,
-    rust_str_from_c, ByteBuffer, ConcurrentHandleMap, ExternError,
+    define_bytebuffer_destructor, define_handle_map_deleter, define_string_destructor, ByteBuffer,
+    ConcurrentHandleMap, ExternError, FfiStr,
 };
-use fxa_client::FirefoxAccount;
+use fxa_client::{device::PushSubscription, msg_types, FirefoxAccount};
 use std::os::raw::c_char;
+use url::Url;
 
 #[no_mangle]
 pub extern "C" fn fxa_enable_logcat_logging() {
@@ -34,17 +40,17 @@ lazy_static::lazy_static! {
 /// A destructor [fxa_free] is provided for releasing the memory for this
 /// pointer type.
 #[no_mangle]
-pub unsafe extern "C" fn fxa_new(
-    content_url: *const c_char,
-    client_id: *const c_char,
-    redirect_uri: *const c_char,
+pub extern "C" fn fxa_new(
+    content_url: FfiStr<'_>,
+    client_id: FfiStr<'_>,
+    redirect_uri: FfiStr<'_>,
     err: &mut ExternError,
 ) -> u64 {
     log::debug!("fxa_new");
     ACCOUNTS.insert_with_output(err, || {
-        let content_url = rust_str_from_c(content_url);
-        let client_id = rust_str_from_c(client_id);
-        let redirect_uri = rust_str_from_c(redirect_uri);
+        let content_url = content_url.as_str();
+        let client_id = client_id.as_str();
+        let redirect_uri = redirect_uri.as_str();
         FirefoxAccount::new(content_url, client_id, redirect_uri)
     })
 }
@@ -56,9 +62,9 @@ pub unsafe extern "C" fn fxa_new(
 /// A destructor [fxa_free] is provided for releasing the memory for this
 /// pointer type.
 #[no_mangle]
-pub unsafe extern "C" fn fxa_from_json(json: *const c_char, err: &mut ExternError) -> u64 {
+pub extern "C" fn fxa_from_json(json: FfiStr<'_>, err: &mut ExternError) -> u64 {
     log::debug!("fxa_from_json");
-    ACCOUNTS.insert_with_result(err, || FirefoxAccount::from_json(rust_str_from_c(json)))
+    ACCOUNTS.insert_with_result(err, || FirefoxAccount::from_json(json.as_str()))
 }
 
 /// Serializes the state of a [FirefoxAccount] instance. It can be restored later with [fxa_from_json].
@@ -108,7 +114,7 @@ pub extern "C" fn fxa_get_token_server_endpoint_url(
 ) -> *mut c_char {
     log::debug!("fxa_get_token_server_endpoint_url");
     ACCOUNTS.call_with_result(error, handle, |fxa| {
-        fxa.get_token_server_endpoint_url().map(|u| u.to_string())
+        fxa.get_token_server_endpoint_url().map(Url::into_string)
     })
 }
 
@@ -125,7 +131,45 @@ pub extern "C" fn fxa_get_connection_success_url(
 ) -> *mut c_char {
     log::debug!("fxa_get_connection_success_url");
     ACCOUNTS.call_with_result(error, handle, |fxa| {
-        fxa.get_connection_success_url().map(|u| u.to_string())
+        fxa.get_connection_success_url().map(Url::into_string)
+    })
+}
+
+/// Get the url to open the user's account-management page.
+///
+/// # Safety
+///
+/// A destructor [fxa_str_free] is provided for releasing the memory for this
+/// pointer type.
+#[no_mangle]
+pub extern "C" fn fxa_get_manage_account_url(
+    handle: u64,
+    entrypoint: FfiStr<'_>,
+    error: &mut ExternError,
+) -> *mut c_char {
+    log::debug!("fxa_get_manage_account_url");
+    ACCOUNTS.call_with_result_mut(error, handle, |fxa| {
+        fxa.get_manage_account_url(entrypoint.as_str())
+            .map(Url::into_string)
+    })
+}
+
+/// Get the url to open the user's devices-management page.
+///
+/// # Safety
+///
+/// A destructor [fxa_str_free] is provided for releasing the memory for this
+/// pointer type.
+#[no_mangle]
+pub extern "C" fn fxa_get_manage_devices_url(
+    handle: u64,
+    entrypoint: FfiStr<'_>,
+    error: &mut ExternError,
+) -> *mut c_char {
+    log::debug!("fxa_get_manage_devices_url");
+    ACCOUNTS.call_with_result_mut(error, handle, |fxa| {
+        fxa.get_manage_devices_url(entrypoint.as_str())
+            .map(Url::into_string)
     })
 }
 
@@ -140,17 +184,17 @@ pub extern "C" fn fxa_get_connection_success_url(
 /// A destructor [fxa_str_free] is provided for releasing the memory for this
 /// pointer type.
 #[no_mangle]
-pub unsafe extern "C" fn fxa_begin_pairing_flow(
+pub extern "C" fn fxa_begin_pairing_flow(
     handle: u64,
-    pairing_url: *const c_char,
-    scope: *const c_char,
+    pairing_url: FfiStr<'_>,
+    scope: FfiStr<'_>,
     error: &mut ExternError,
 ) -> *mut c_char {
     log::debug!("fxa_begin_pairing_flow");
     ACCOUNTS.call_with_result_mut(error, handle, |fxa| {
-        let pairing_url = rust_str_from_c(pairing_url);
-        let scope = rust_str_from_c(scope);
-        let scopes: Vec<&str> = scope.split(" ").collect();
+        let pairing_url = pairing_url.as_str();
+        let scope = scope.as_str();
+        let scopes: Vec<&str> = scope.split(' ').collect();
         fxa.begin_pairing_flow(&pairing_url, &scopes)
     })
 }
@@ -170,32 +214,32 @@ pub unsafe extern "C" fn fxa_begin_pairing_flow(
 /// A destructor [fxa_str_free] is provided for releasing the memory for this
 /// pointer type.
 #[no_mangle]
-pub unsafe extern "C" fn fxa_begin_oauth_flow(
+pub extern "C" fn fxa_begin_oauth_flow(
     handle: u64,
-    scope: *const c_char,
+    scope: FfiStr<'_>,
     wants_keys: bool,
     error: &mut ExternError,
 ) -> *mut c_char {
     log::debug!("fxa_begin_oauth_flow");
     ACCOUNTS.call_with_result_mut(error, handle, |fxa| {
-        let scope = rust_str_from_c(scope);
-        let scopes: Vec<&str> = scope.split(" ").collect();
+        let scope = scope.as_str();
+        let scopes: Vec<&str> = scope.split(' ').collect();
         fxa.begin_oauth_flow(&scopes, wants_keys)
     })
 }
 
 /// Finish an OAuth flow initiated by [fxa_begin_oauth_flow].
 #[no_mangle]
-pub unsafe extern "C" fn fxa_complete_oauth_flow(
+pub extern "C" fn fxa_complete_oauth_flow(
     handle: u64,
-    code: *const c_char,
-    state: *const c_char,
+    code: FfiStr<'_>,
+    state: FfiStr<'_>,
     error: &mut ExternError,
 ) {
     log::debug!("fxa_complete_oauth_flow");
     ACCOUNTS.call_with_result_mut(error, handle, |fxa| {
-        let code = rust_str_from_c(code);
-        let state = rust_str_from_c(state);
+        let code = code.as_str();
+        let state = state.as_str();
         fxa.complete_oauth_flow(code, state)
     });
 }
@@ -212,16 +256,179 @@ pub unsafe extern "C" fn fxa_complete_oauth_flow(
 /// A destructor [fxa_bytebuffer_free] is provided for releasing the memory for this
 /// pointer type.
 #[no_mangle]
-pub unsafe extern "C" fn fxa_get_access_token(
+pub extern "C" fn fxa_get_access_token(
     handle: u64,
-    scope: *const c_char,
+    scope: FfiStr<'_>,
     error: &mut ExternError,
 ) -> ByteBuffer {
     log::debug!("fxa_get_access_token");
     ACCOUNTS.call_with_result_mut(error, handle, |fxa| {
-        let scope = rust_str_from_c(scope);
-        fxa.get_access_token(&scope)
+        let scope = scope.as_str();
+        fxa.get_access_token(scope)
     })
+}
+
+/// Update the Push subscription information for the current device.
+#[no_mangle]
+pub extern "C" fn fxa_set_push_subscription(
+    handle: u64,
+    endpoint: FfiStr<'_>,
+    public_key: FfiStr<'_>,
+    auth_key: FfiStr<'_>,
+    error: &mut ExternError,
+) {
+    log::debug!("fxa_set_push_subscription");
+    ACCOUNTS.call_with_result_mut(error, handle, |fxa| {
+        let ps = PushSubscription {
+            endpoint: endpoint.into_string(),
+            public_key: public_key.into_string(),
+            auth_key: auth_key.into_string(),
+        };
+        // We don't really care about passing back the resulting Device record.
+        // We might in the future though.
+        fxa.set_push_subscription(&ps).map(|_| ())
+    })
+}
+
+/// Update the display name for the current device.
+#[no_mangle]
+pub extern "C" fn fxa_set_device_name(
+    handle: u64,
+    display_name: FfiStr<'_>,
+    error: &mut ExternError,
+) {
+    log::debug!("fxa_set_device_name");
+    ACCOUNTS.call_with_result_mut(error, handle, |fxa| {
+        // We don't really care about passing back the resulting Device record.
+        // We might in the future though.
+        fxa.set_device_name(display_name.as_str()).map(|_| ())
+    })
+}
+
+/// Fetch the devices (including the current one) in the current account.
+///
+/// # Safety
+///
+/// A destructor [fxa_bytebuffer_free] is provided for releasing the memory for this
+/// pointer type.
+#[no_mangle]
+pub extern "C" fn fxa_get_devices(handle: u64, error: &mut ExternError) -> ByteBuffer {
+    log::debug!("fxa_get_devices");
+    ACCOUNTS.call_with_result_mut(error, handle, |fxa| {
+        fxa.get_devices().map(|d| {
+            let devices = d.into_iter().map(|device| device.into()).collect();
+            fxa_client::msg_types::Devices { devices }
+        })
+    })
+}
+
+/// Poll and parse available remote commands targeted to our own device.
+///
+/// # Safety
+///
+/// A destructor [fxa_bytebuffer_free] is provided for releasing the memory for this
+/// pointer type.
+#[no_mangle]
+pub extern "C" fn fxa_poll_device_commands(handle: u64, error: &mut ExternError) -> ByteBuffer {
+    log::debug!("fxa_poll_device_commands");
+    ACCOUNTS.call_with_result_mut(error, handle, |fxa| {
+        fxa.poll_device_commands().map(|evs| {
+            let events = evs.into_iter().map(|e| e.into()).collect();
+            fxa_client::msg_types::AccountEvents { events }
+        })
+    })
+}
+
+/// Destroy the device given a device_id.
+#[no_mangle]
+pub extern "C" fn fxa_destroy_device(handle: u64, device_id: FfiStr<'_>, error: &mut ExternError) {
+    log::debug!("fxa_destroy_device");
+    ACCOUNTS.call_with_result_mut(error, handle, |fxa| {
+        fxa.destroy_device(device_id.as_str()).map(|_| ())
+    })
+}
+
+/// Handle a push payload coming from the Firefox Account servers.
+///
+/// # Safety
+///
+/// A destructor [fxa_bytebuffer_free] is provided for releasing the memory for this
+/// pointer type.
+#[no_mangle]
+pub extern "C" fn fxa_handle_push_message(
+    handle: u64,
+    json_payload: FfiStr<'_>,
+    error: &mut ExternError,
+) -> ByteBuffer {
+    log::debug!("fxa_handle_push_message");
+    ACCOUNTS.call_with_result_mut(error, handle, |fxa| {
+        fxa.handle_push_message(json_payload.as_str()).map(|evs| {
+            let events = evs.into_iter().map(|e| e.into()).collect();
+            fxa_client::msg_types::AccountEvents { events }
+        })
+    })
+}
+
+/// Initalizes our own device, most of the time this will be called right after logging-in
+/// for the first time.
+/// This method is marked un-safe as it reconstitutes an array of capabilities
+/// from a pointer.
+#[no_mangle]
+pub unsafe extern "C" fn fxa_initialize_device(
+    handle: u64,
+    name: FfiStr<'_>,
+    device_type: i32,
+    capabilities_data: *const u8,
+    capabilities_len: i32,
+    error: &mut ExternError,
+) {
+    log::debug!("fxa_initialize_device");
+    ACCOUNTS.call_with_result_mut(error, handle, |fxa| {
+        let buffer = get_buffer(capabilities_data, capabilities_len);
+        let capabilities: fxa_client::msg_types::Capabilities = prost::Message::decode(buffer)?;
+        // This should not fail as device_type i32 representation is derived from our .proto schema.
+        let device_type =
+            msg_types::device::Type::from_i32(device_type).expect("Unknown device type code");
+        fxa.initialize_device(
+            name.as_str(),
+            device_type.into(),
+            &capabilities.to_capabilities_vec(),
+        )
+    })
+}
+
+/// Ensure that the device capabilities are registered with the server.
+#[no_mangle]
+pub extern "C" fn fxa_ensure_capabilities(handle: u64, error: &mut ExternError) {
+    log::debug!("fxa_ensure_capabilities");
+    ACCOUNTS.call_with_result_mut(error, handle, |fxa| fxa.ensure_capabilities())
+}
+
+/// Send a tab to another device identified by its Device ID.
+#[no_mangle]
+pub extern "C" fn fxa_send_tab(
+    handle: u64,
+    target_device_id: FfiStr<'_>,
+    title: FfiStr<'_>,
+    url: FfiStr<'_>,
+    error: &mut ExternError,
+) {
+    log::debug!("fxa_send_tab");
+    let target = target_device_id.as_str();
+    let title = title.as_str();
+    let url = url.as_str();
+    ACCOUNTS.call_with_result_mut(error, handle, |fxa| fxa.send_tab(target, title, url))
+}
+
+unsafe fn get_buffer<'a>(data: *const u8, len: i32) -> &'a [u8] {
+    assert!(len >= 0, "Bad buffer len: {}", len);
+    if len == 0 {
+        // This will still fail, but as a bad protobuf format.
+        &[]
+    } else {
+        assert!(!data.is_null(), "Unexpected null data pointer");
+        std::slice::from_raw_parts(data, len as usize)
+    }
 }
 
 define_handle_map_deleter!(ACCOUNTS, fxa_free);
