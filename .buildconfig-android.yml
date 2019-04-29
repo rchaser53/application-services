@@ -1,4 +1,4 @@
-libraryVersion: 0.27.1-lina1
+libraryVersion: 0.27.1-lina5
 groupId: org.mozilla.appservices
 projects:
   fxa-client-library:
