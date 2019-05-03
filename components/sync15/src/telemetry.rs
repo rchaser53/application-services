@@ -9,13 +9,12 @@ use std::collections::HashMap;
 use std::time;
 
 // We use serde to serialize to json (but we never need to deserialize)
+use failure::Fail;
+use ffi_support::implement_into_ffi_by_json;
 use serde::ser::{self, Serialize, Serializer};
 use serde_derive::*;
 #[cfg(test)]
 use serde_json::{self, json};
-use ffi_support::implement_into_ffi_by_json;
-
-use crate::error::Error;
 
 // For skip_serializing_if
 fn skip_if_default<T: PartialEq + Default>(v: &T) -> bool {
@@ -253,8 +252,10 @@ pub enum SyncFailure {
     Http { code: u32 },
 }
 
-pub fn sync_failure_from_error(e: &Error) -> SyncFailure {
+pub fn sync_failure_from_error(e: &impl Fail) -> SyncFailure {
     SyncFailure::Unexpected {
+        // TODO: Distinguish between error types, truncate, and anonymize
+        // messages.
         error: e.to_string(),
     }
 }
@@ -667,6 +668,31 @@ impl SyncTelemetryPing {
         }
     }
 
+    pub fn record<E, F>(func: F) -> Self
+    where
+        E: Fail,
+        F: FnOnce(&mut Self) -> std::result::Result<(), E>,
+    {
+        let mut sync_ping = SyncTelemetryPing::new();
+        if let Err(e) = func(&mut sync_ping) {
+            log::warn!("Sync failed! {:?}", e);
+            let f = sync_failure_from_error(&e);
+            match sync_ping.last_sync() {
+                Some(telem_sync) => {
+                    telem_sync.failure(f);
+                }
+                None => {
+                    // If we didn't get far enough to record the sync, create a
+                    // failed one now.
+                    let mut telem_sync = SyncTelemetry::new();
+                    telem_sync.failure(f);
+                    sync_ping.sync(telem_sync)
+                }
+            }
+        }
+        sync_ping
+    }
+
     pub fn uid(&mut self, uid: String) {
         if let Some(ref existing) = self.uid {
             if *existing != uid {
@@ -683,6 +709,10 @@ impl SyncTelemetryPing {
 
     pub fn event(&mut self, e: Event) {
         self.events.push(e);
+    }
+
+    pub fn last_sync(&mut self) -> Option<&mut SyncTelemetry> {
+        self.syncs.last_mut()
     }
 }
 

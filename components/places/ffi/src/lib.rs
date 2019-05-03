@@ -397,16 +397,13 @@ pub extern "C" fn sync15_history_sync(
     error: &mut ExternError,
 ) -> *mut c_char {
     log::debug!("sync15_history_sync");
-    APIS.call_with_result(error, handle, |api| -> places::Result<_> {
-        let ping = api.sync_history(
-            &sync15::Sync15StorageClientInit {
-                key_id: key_id.into_string(),
-                access_token: access_token.into_string(),
-                tokenserver_url: parse_url(tokenserver_url.as_str())?,
-            },
-            &sync15::KeyBundle::from_ksync_base64(sync_key.as_str())?,
-        )?;
-        Ok(ping)
+    APIS.call_with_output(error, handle, |api| {
+        api.sync_history(
+            key_id.into_string(),
+            access_token.into_string(),
+            tokenserver_url.as_str(),
+            sync_key.as_str(),
+        )
     })
 }
 
@@ -420,16 +417,13 @@ pub extern "C" fn sync15_bookmarks_sync(
     error: &mut ExternError,
 ) -> *mut c_char {
     log::debug!("sync15_bookmarks_sync");
-    APIS.call_with_result(error, handle, |api| -> places::Result<_> {
-        let ping = api.sync_bookmarks(
-            &sync15::Sync15StorageClientInit {
-                key_id: key_id.into_string(),
-                access_token: access_token.into_string(),
-                tokenserver_url: parse_url(tokenserver_url.as_str())?,
-            },
-            &sync15::KeyBundle::from_ksync_base64(sync_key.as_str())?,
-        )?;
-        Ok(ping)
+    APIS.call_with_output(error, handle, |api| {
+        api.sync_bookmarks(
+            key_id.into_string(),
+            access_token.into_string(),
+            tokenserver_url.as_str(),
+            sync_key.as_str(),
+        )
     })
 }
 

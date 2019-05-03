@@ -21,6 +21,7 @@ use std::sync::{
     Arc, Mutex, Weak,
 };
 use sync15::{telemetry, MemoryCachedState};
+use url::Url;
 
 // Not clear if this should be here, but this is the "global sync state"
 // which is persisted to disk and reused for all engines.
@@ -222,14 +223,12 @@ impl PlacesApi {
         }
     }
 
-    // TODO: We need a better result here so we can return telemetry.
-    // We possibly want more than just a `SyncTelemetryPing` so we can
-    // return additional "custom" telemetry if the app wants it.
-    pub fn sync_history(
+    fn sync_history_with_telemetry(
         &self,
         client_init: &sync15::Sync15StorageClientInit,
         key_bundle: &sync15::KeyBundle,
-    ) -> Result<telemetry::SyncTelemetryPing> {
+        sync_ping: &mut telemetry::SyncTelemetryPing,
+    ) -> Result<()> {
         let mut guard = self.sync_state.lock().unwrap();
         let conn = self.open_sync_connection()?;
         if guard.is_none() {
@@ -248,13 +247,12 @@ impl PlacesApi {
         let store = HistoryStore::new(&conn, &interruptee);
         let mut mem_cached_state = sync_state.mem_cached_state.take();
         let mut disk_cached_state = sync_state.disk_cached_state.take();
-        let mut sync_ping = telemetry::SyncTelemetryPing::new();
         let result = store.sync(
             &client_init,
             &key_bundle,
             &mut mem_cached_state,
             &mut disk_cached_state,
-            &mut sync_ping,
+            sync_ping,
         );
         // even on failure we set the persisted state - sync itself takes care
         // to ensure this has been None'd out if necessary.
@@ -264,15 +262,36 @@ impl PlacesApi {
 
         result?;
 
-        Ok(sync_ping)
+        Ok(())
+    }
+
+    pub fn sync_history(
+        &self,
+        key_id: String,
+        access_token: String,
+        tokenserver_url: &str,
+        sync_key: &str,
+    ) -> telemetry::SyncTelemetryPing {
+        telemetry::SyncTelemetryPing::record(|sync_ping| {
+            self.sync_history_with_telemetry(
+                &sync15::Sync15StorageClientInit {
+                    key_id,
+                    access_token,
+                    tokenserver_url: Url::parse(tokenserver_url)?,
+                },
+                &sync15::KeyBundle::from_ksync_base64(sync_key)?,
+                sync_ping,
+            )
+        })
     }
 
     // TODO: reduce duplication with above
-    pub fn sync_bookmarks(
+    fn sync_bookmarks_with_telemetry(
         &self,
         client_init: &sync15::Sync15StorageClientInit,
         key_bundle: &sync15::KeyBundle,
-    ) -> Result<telemetry::SyncTelemetryPing> {
+        sync_ping: &mut telemetry::SyncTelemetryPing,
+    ) -> Result<()> {
         let mut guard = self.sync_state.lock().unwrap();
         let conn = self.open_sync_connection()?;
         if guard.is_none() {
@@ -291,13 +310,12 @@ impl PlacesApi {
         let store = BookmarksStore::new(&conn, &interruptee);
         let mut mem_cached_state = sync_state.mem_cached_state.take();
         let mut disk_cached_state = sync_state.disk_cached_state.take();
-        let mut sync_ping = telemetry::SyncTelemetryPing::new();
         let result = store.sync(
             &client_init,
             &key_bundle,
             &mut mem_cached_state,
             &mut disk_cached_state,
-            &mut sync_ping,
+            sync_ping,
         );
         // even on failure we set the persisted state - sync itself takes care
         // to ensure this has been None'd out if necessary.
@@ -307,7 +325,27 @@ impl PlacesApi {
 
         result?;
 
-        Ok(sync_ping)
+        Ok(())
+    }
+
+    pub fn sync_bookmarks(
+        &self,
+        key_id: String,
+        access_token: String,
+        tokenserver_url: &str,
+        sync_key: &str,
+    ) -> telemetry::SyncTelemetryPing {
+        telemetry::SyncTelemetryPing::record(|sync_ping| {
+            self.sync_bookmarks_with_telemetry(
+                &sync15::Sync15StorageClientInit {
+                    key_id,
+                    access_token,
+                    tokenserver_url: Url::parse(tokenserver_url)?,
+                },
+                &sync15::KeyBundle::from_ksync_base64(sync_key)?,
+                sync_ping,
+            )
+        })
     }
 
     pub fn reset_bookmarks(&self) -> Result<()> {
