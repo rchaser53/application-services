@@ -118,6 +118,8 @@ impl<'a> BookmarksStore<'a> {
         descendants: Vec<MergedDescendant<'t>>,
         deletions: Vec<Deletion<'_>>,
     ) -> Result<()> {
+        let now = Timestamp::now();
+
         // First, insert rows for all merged descendants.
         sql_support::each_sized_chunk(
             &descendants,
@@ -147,13 +149,14 @@ impl<'a> BookmarksStore<'a> {
                 }
                 self.db.execute(&format!("
                     INSERT INTO mergedTree(localGuid, remoteGuid, mergedGuid, mergedParentGuid, level,
-                                           position, useRemote, shouldUpload)
+                                           position, useRemote, shouldUpload, mergedAt)
                     VALUES {}",
                     sql_support::repeat_display(chunk.len(), ",", |index, f| {
                         let d = &chunk[index];
-                        write!(f, "(?, ?, ?, ?, {}, {}, {}, {})",
+                        write!(f, "(?, ?, ?, ?, {}, {}, {}, {}, {})",
                             d.level, d.position, d.merged_node.merge_state.should_apply(),
-                            d.merged_node.merge_state.upload_reason() != UploadReason::None)
+                            d.merged_node.merge_state.upload_reason() != UploadReason::None,
+                            now.as_millis())
                     })
                 ), &params)?;
                 Ok(())
@@ -164,11 +167,17 @@ impl<'a> BookmarksStore<'a> {
         sql_support::each_chunk(&deletions, |chunk, _| -> Result<()> {
             self.db.execute(
                 &format!(
-                    "INSERT INTO itemsToRemove(guid, localLevel, shouldUploadTombstone)
+                    "INSERT INTO itemsToRemove(guid, localLevel, shouldUploadTombstone, removedAt)
                      VALUES {}",
                     sql_support::repeat_display(chunk.len(), ",", |index, f| {
                         let d = &chunk[index];
-                        write!(f, "(?, {}, {})", d.local_level, d.should_upload_tombstone)
+                        write!(
+                            f,
+                            "(?, {}, {}, {})",
+                            d.local_level,
+                            d.should_upload_tombstone,
+                            now.as_millis()
+                        )
                     })
                 ),
                 chunk.iter().map(|d| d.guid.as_str()),

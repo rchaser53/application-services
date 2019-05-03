@@ -15,7 +15,7 @@ use crate::storage::bookmarks::create_bookmark_roots;
 use rusqlite::NO_PARAMS;
 use sql_support::ConnExt;
 
-const VERSION: i64 = 8;
+const VERSION: i64 = 9;
 
 // Shared schema and temp tables for the read-write and Sync connections.
 const CREATE_SHARED_SCHEMA_SQL: &str = include_str!("../../sql/create_shared_schema.sql");
@@ -202,6 +202,8 @@ fn upgrade(db: &PlacesDb, from: i64) -> Result<()> {
         ],
         || Ok(()),
     )?;
+    // Added bookmark sync actions table for telemetry.
+    migration(db, 8, 9, &[CREATE_SHARED_SCHEMA_SQL], || Ok(()))?;
     // Add more migrations here...
 
     if get_current_schema_version(db)? == VERSION {
