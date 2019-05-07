@@ -33,10 +33,19 @@ suggest that this lower-level component also be written in Rust and everything
   Or more specifically, we'd like to avoid assuming any particular linkage or
   packaging of Rust implemented engines.
 
-Even with these complications, we expect the high-level component
-to be written in a platform specific language (ie, Kotlin or Swift) and our
-lower-level component to be implemented in Rust and delivered as part of the
-application-services library - but that's not a free-pass.
+Even with these complications, we expect there to be a number of high-level
+components, each written in a platform specific language (eg, Kotlin or Swift)
+and a single lower-level component to be implemented in Rust and delivered
+as part of the application-services library - but that's not a free-pass.
+
+Why "a number of high-level components"? Because that is the thing which
+understands the requirements of the embedding application. For example, Android
+may end up with a single high-level component in the android-components repo
+and shared between all Android components. Alternatively, the Android teams
+may decide the sync manager isn't generic enough to share, so each app will
+have their own. iOS will probably end up with its own and you could imagine
+a future where Desktop does too - but they should all be able to share the
+low level component.
 
 # The responsibilities of the Sync Manager.
 
@@ -69,7 +78,7 @@ The primary responsibilities of the "low level" portion of the sync manager are:
 
 * Enforce constraints necessary to ensure the entire ecosystem is not
   subject to undue load. For example, this component should ignore attempts to
-  sync continiously, or to sync when the services have requested backoff.
+  sync continuously, or to sync when the services have requested backoff.
 
 * Manage the "clients" collection - we probably can't ignore this any longer,
   especially for bookmarks (as desktop will send a wipe command on bookmark
@@ -80,16 +89,25 @@ The primary responsibilities of the "low level" portion of the sync manager are:
   "the service requested we backoff for some period", "an authentication error
   occurred", and possibly others.
 
-* Perform, or coordinate, the actual sync of the engines - from the containing
-  app's POV, there's a single "sync now" entry-point (in practice there might
-  be a couple, but conceptually there's a single way to sync). Note that as
-  mentioned above, this may involve coordinating with engines which aren't
-  implemented in Rust.
+* Perform, or coordinate, the actual sync of the rust implemented engines -
+  from the containing app's POV, there's a single "sync now" entry-point (in
+  practice there might be a couple, but conceptually there's a single way to
+  sync). Note that as below, how non-rust implemented engines are managed is
+  TBD.
 
 * Manage the collection of (but *not* the submission of) telemetry from the
   various engines.
 
 * Expose APIs and otherwise coordinate with the high-level component.
+
+Stuff we aren't quite sure where it fits include:
+
+* Coordination with non-rust implemented engines. These engines are almost
+  certainly going to be implemented in the same language as the high-level
+  component, which will make integration simpler. However, the low-level
+  component will almost certainly need some information about these engines for
+  populating info/collections etc. For now, we are punting on this until things
+  become a bit clearer.
 
 # Implementation Details.
 
@@ -155,9 +173,19 @@ nor whether the device is currently connected to WiFi.
 
 A thorn here is for persisted state - it would be ideal if the low-level
 component could avoid needing to persist any state, so it can avoid any
-kind of storage abstraction. A solution here might be that the low-level
-component can delegate state storage to the high-level component in an
-opaque way.
+kind of storage abstraction. We have a couple of ways of managing this:
+
+* The state which needs to be persisted is quite small, so we could delegate
+  state storage to the high-level component in an opaque way, as this
+  high-level component almost certainly already has storage requirements, such
+  as storing the "choose what to sync" preferences.
+
+* The low-level component could add its own storage abstraction. This would
+  isolate the high-level component from this storage requirement, but would
+  add complexity to the sync manager - for example, it would need to be passed
+  a directory where it should create a file or database.
+
+We'll probably go with the former.
 
 # Implementation plan for the low-level component.
 
@@ -183,7 +211,7 @@ disconnecting a device (eg, when a device is lost or stolen), our lives would
 probably be made much simpler by initially supporting only per-engine wipe
 commands.
 
-## Collections vs engines vs stores vs preferences
+## Collections vs engines vs stores vs preferences vs Apis
 
 For the purposes of the sync manager, we define:
 
@@ -192,17 +220,25 @@ For the purposes of the sync manager, we define:
   entire sync ecosystem - ie, desktop and mobile devices all need to agree
   about what engines exist and what the identifier for an engine is.
 
+* An *Api* is the unit exposed to the application layer for general application
+  functionality. Application services has 'places' and 'logins' Apis and is
+  the API used by the application to store and fetch items. Each 'Api' may
+  have one or more 'stores' (although the application layer will generally not
+  interact directly with a store)
+
 * A *store* is the code which actually syncs. This is largely an implementation
   detail. There may be multiple stores per engine (eg, the "history" engine
-  may have "history" and "forms" stores.)
+  may have "history" and "forms" stores) and a single 'Api' may expose multiple
+  stores (eg, the "places Api" will expose history and bookmarks stores)
 
 * A *collection* is a unit of storage on a server. It's even more of an
   implementation detail than a store. For example, you might imagine a future
   where the "history" store uses multiple "collections" to help with containers.
 
 In practice, this means that the high-level component should only need to care
-about an *engine*. The low-level component will manage the mapping of engines
-to stores.
+about an *engine* (for exposing a choice of what to sync to the user) and an
+*api* (for interacting with the data managed by that api). The low-level
+component will manage the mapping of engines to stores.
 
 ## The declined list
 
@@ -239,7 +275,7 @@ To clarify, consider:
   This device does manage to write the new list to the server.
 
 * This device restarts and the network is up. It believes history is enabled
-  but logins is now - however, the state on the server is the exact opposite.
+  but logins is not - however, the state on the server is the exact opposite.
 
 How does this device react?
 
@@ -460,7 +496,7 @@ impl SyncManager {
   // thread.
   fn interrupt() -> Result<()>;
 
-  // Disconnect this device from sync. This may "reset" the store, but will
+  // Disconnect this device from sync. This may "reset" the stores, but will
   // not wipe local data.
   fn disconnect(&self) -> Result<()>;
 
