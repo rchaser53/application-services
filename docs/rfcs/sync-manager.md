@@ -211,6 +211,18 @@ disconnecting a device (eg, when a device is lost or stolen), our lives would
 probably be made much simpler by initially supporting only per-engine wipe
 commands.
 
+Note that there has been some discussion about not implementing the client
+engine and replacing "commands" with some other mechanism. However, we have
+decided to not do that because the implementation isn't considered too
+difficult, and because desktop will probably require a number of changes to
+remove it (eg, "synced tabs" will not work correctly without a client record
+with the same guid as the clients engine.)
+
+Note however that unlike desktop, we will use the FxA device ID as the client
+ID. Because FxA device IDs are more ephemeral than sync IDs, it will be
+necessary for engines using this ID to track the most-recent ID they synced
+with so the old record can be deleted when a change is detected.
+
 ## Collections vs engines vs stores vs preferences vs Apis
 
 For the purposes of the sync manager, we define:
