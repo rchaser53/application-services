@@ -15,7 +15,9 @@ use crate::error::*;
 use crate::frecency::{calculate_frecency, DEFAULT_FRECENCY_SETTINGS};
 use crate::storage::{bookmarks::BookmarkRootGuid, delete_meta, get_meta, put_meta};
 use crate::types::{BookmarkType, SyncGuid, SyncStatus, Timestamp};
-use dogear::{self, Content, Deletion, Item, MergedDescendant, MergedRoot, Tree, UploadReason};
+use dogear::{
+    self, AbortSignal, Content, Deletion, Item, MergedDescendant, MergedRoot, Tree, UploadReason,
+};
 use rusqlite::{Row, NO_PARAMS};
 use sql_support::{self, ConnExt, SqlInterruptScope};
 use std::collections::HashMap;
@@ -38,6 +40,19 @@ const COLLECTION_SYNCID_META_KEY: &str = "bookmarks_sync_id";
 /// maximums mean fewer write statements, but longer transactions, possibly
 /// blocking writes from other connections.
 const MAX_FRECENCIES_TO_RECALCULATE_PER_CHUNK: usize = 400;
+
+/// Adapts an interruptee to a Dogear abort signal.
+struct MergeInterruptee<'a, I>(&'a I);
+
+impl<'a, I> AbortSignal for MergeInterruptee<'a, I>
+where
+    I: interrupt::Interruptee,
+{
+    #[inline]
+    fn aborted(&self) -> bool {
+        self.0.was_interrupted()
+    }
+}
 
 pub struct BookmarksStore<'a> {
     pub db: &'a PlacesDb,
@@ -787,7 +802,7 @@ impl<'a> Merger<'a> {
             return Ok(dogear::Stats::default());
         }
         // Merge and stage outgoing items via dogear.
-        let stats = self.merge_with_driver(&Driver)?;
+        let stats = self.merge_with_driver(&Driver, &MergeInterruptee(self.store.interruptee))?;
         log::debug!("merge completed: {:?}", stats);
         Ok(stats)
     }
@@ -961,6 +976,7 @@ impl<'a> dogear::Store<Error> for Merger<'a> {
         let mut stmt = self.store.db.prepare(&sql)?;
         let mut results = stmt.query(NO_PARAMS)?;
         while let Some(row) = results.next()? {
+            self.store.interruptee.err_if_interrupted()?;
             let p = builder.item(self.remote_row_to_item(&row)?)?;
             if let Some(parent_guid) = row.get::<_, Option<SyncGuid>>("parentGuid")? {
                 p.by_parent_guid(parent_guid.into())?;
