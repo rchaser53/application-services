@@ -366,9 +366,7 @@ impl Connection for ConnectHttp {
             }
         };
         if payload.uaid != self.uaid.clone().unwrap() {
-            return Err(
-                CommunicationServerError("Invalid Response from server".to_string()).into(),
-            );
+            return Err(CommunicationServerError("Invalid Response from server".to_string()).into());
         }
         Ok(payload
             .channel_ids
